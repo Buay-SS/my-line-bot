@@ -1,9 +1,9 @@
 import os
 import json
-import re # <-- เพิ่ม import re
+import re
 from flask import Flask, request, abort
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -32,14 +32,11 @@ _aliases_cache = None
 
 def get_spreadsheet():
     global _spreadsheet
-    if _spreadsheet:
-        return _spreadsheet
-    print("--- First time access. Connecting to Google Spreadsheet... ---")
+    if _spreadsheet: return _spreadsheet
+    print("--- Connecting to Google Spreadsheet... ---")
     try:
         scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file']
-        credentials = Credentials.from_service_account_info(
-            json.loads(GOOGLE_CREDENTIALS_JSON_STRING), scopes=scopes
-        )
+        credentials = Credentials.from_service_account_info(json.loads(GOOGLE_CREDENTIALS_JSON_STRING), scopes=scopes)
         gc = gspread.authorize(credentials)
         _spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
         print("--- Successfully connected to Google Spreadsheet! ---")
@@ -50,9 +47,8 @@ def get_spreadsheet():
 
 def get_aliases():
     global _aliases_cache
-    if _aliases_cache is not None:
-        return _aliases_cache
-    print("--- First time access. Reading aliases... ---")
+    if _aliases_cache is not None: return _aliases_cache
+    print("--- Reading aliases... ---")
     spreadsheet = get_spreadsheet()
     if not spreadsheet:
         _aliases_cache = {}
@@ -61,7 +57,7 @@ def get_aliases():
         alias_sheet = spreadsheet.worksheet("Aliases")
         records = alias_sheet.get_all_records()
         _aliases_cache = {record['OriginalName']: record['Nickname'] for record in records if record.get('OriginalName')}
-        print(f"--- Successfully loaded {_aliases_cache.__len__()} aliases. ---")
+        print(f"--- Loaded {_aliases_cache.__len__()} aliases. ---")
         return _aliases_cache
     except Exception as e:
         print(f"--- ERROR reading aliases: {e} ---")
@@ -69,34 +65,108 @@ def get_aliases():
         return _aliases_cache
 
 # =========================================================
-#  **ฟังก์ชันใหม่สำหรับเพิ่มนามแฝง**
+#  **ฟังก์ชันใหม่ล่าสุด: บันทึกรายการลงชีท Transactions**
 # =========================================================
-def add_alias_to_sheet(original_name, nickname):
+def log_transaction_to_sheet(log_data):
     spreadsheet = get_spreadsheet()
     if not spreadsheet:
-        return False, "ไม่สามารถเชื่อมต่อกับฐานข้อมูลได้"
+        return False, "ไม่สามารถเชื่อมต่อกับฐานข้อมูล (Sheet) ได้"
+    try:
+        worksheet = spreadsheet.worksheet("Transactions")
+        
+        # สร้าง Timestamp เวลาประเทศไทย (UTC+7)
+        thai_tz = timezone(timedelta(hours=7))
+        timestamp = datetime.now(thai_tz).strftime("%Y-%m-%d %H:%M:%S")
+        
+        new_row = [
+            timestamp,
+            log_data.get('date', 'N/A'),
+            log_data.get('from', 'N/A'),
+            log_data.get('to', 'N/A'),
+            log_data.get('amount', 0.0),
+            log_data.get('recorded_by', 'N/A')
+        ]
+        worksheet.append_row(new_row, value_input_option='USER_ENTERED')
+        print(f"--- Successfully logged transaction for {log_data.get('recorded_by')} ---")
+        return True, "บันทึกรายการเรียบร้อย!"
+    except Exception as e:
+        print(f"--- ERROR logging transaction: {e} ---")
+        return False, "เกิดข้อผิดพลาดในการบันทึกข้อมูล"
+
+
+# --- Event Handler: รูปภาพ (อัปเกรดครั้งสุดท้าย!) ---
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image_message(event):
+    source_id = event.source.sender_id
+    if not is_approved(source_id):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="บอทกำลังรอการอนุมัติจากผู้ดูแลระบบครับ"))
+        return
+
+    message_content = line_bot_api.get_message_content(event.message.id)
+    url_api = "https://api.ocr.space/parse/image"
+    response = requests.post(url_api, 
+        files={"image": ("receipt.jpg", message_content.content, "image/jpeg")},
+        data={"apikey": OCR_SPACE_API_KEY, "language": "tha", "OCREngine": "2"}
+    )
+    result = response.json()
+
+    if result.get("IsErroredOnProcessing") == False and result.get("ParsedResults"):
+        detected_text = result["ParsedResults"][0]["ParsedText"]
+        parsed_data = parse_slip(detected_text)
+        
+        aliases = get_aliases()
+        display_account = aliases.get(parsed_data.get('account'), parsed_data.get('account'))
+        display_recipient = aliases.get(parsed_data.get('recipient'), parsed_data.get('recipient'))
+        
+        summary_text = (
+            f"สรุปรายการ:\n"
+            f"-------------------\n"
+            f"วันที่: {parsed_data.get('date', 'N/A')}\n"
+            f"จาก: {display_account}\n"
+            f"ถึง: {display_recipient}\n"
+            f"จำนวน: {parsed_data.get('amount', 'N/A')} บาท"
+        )
+
+        # --- ส่วนของการบันทึกข้อมูล ---
+        log_data = {
+            'date': parsed_data.get('date', 'N/A'),
+            'from': display_account,
+            'to': display_recipient,
+            'amount': parsed_data.get('amount', 0.0),
+            'recorded_by': source_id
+        }
+        log_success, log_message = log_transaction_to_sheet(log_data)
+        # -------------------------
+
+        # เพิ่มสถานะการบันทึกลงในข้อความตอบกลับ
+        final_reply_text = f"{summary_text}\n-------------------\nสถานะ: {log_message}"
+
+    else:
+        final_reply_text = "ขออภัยครับ ไม่สามารถอ่านข้อความจากรูปภาพได้"
+
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=final_reply_text))
+
+
+# (โค้ดส่วนอื่นๆ ที่เหลือทั้งหมดเหมือนเดิม ไม่ต้องแก้ไข)
+# ...
+def add_alias_to_sheet(original_name, nickname):
+    spreadsheet = get_spreadsheet()
+    if not spreadsheet: return False, "ไม่สามารถเชื่อมต่อกับฐานข้อมูลได้"
     try:
         alias_sheet = spreadsheet.worksheet("Aliases")
-        # เช็คว่ามีชื่อจริงนี้อยู่แล้วหรือไม่
         cell = alias_sheet.find(original_name, in_column=1)
         if cell:
-            # ถ้ามีแล้ว ให้อัปเดตชื่อเล่นแทน
             alias_sheet.update_cell(cell.row, 2, nickname)
             message = "อัปเดตนามแฝงสำเร็จ!"
         else:
-            # ถ้ายังไม่มี ให้เพิ่มแถวใหม่
             alias_sheet.append_row([original_name, nickname])
             message = "เพิ่มนามแฝงใหม่สำเร็จ!"
-        
-        # เคลียร์ Cache เพื่อให้ระบบโหลดใหม่ในครั้งถัดไป
         global _aliases_cache
         _aliases_cache = None
         return True, message
     except Exception as e:
-        print(f"--- ERROR adding alias: {e} ---")
         return False, f"เกิดข้อผิดพลาด: {e}"
 
-# (ฟังก์ชัน is_approved และ register_source เหมือนเดิม)
 def is_approved(source_id):
     spreadsheet = get_spreadsheet()
     if not spreadsheet: return False
@@ -117,46 +187,6 @@ def register_source(source_id, display_name, source_type):
                 line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=f"New {source_type} needs approval:\nName: {display_name}"))
     except Exception as e: print(f"Error registering source: {e}")
 
-# --- Event Handler: ข้อความ (อัปเกรดใหม่!) ---
-@handler.add(MessageEvent, message=TextMessage)
-def handle_text_message(event):
-    text = event.message.text
-    user_id = event.source.user_id
-
-    # ตรวจสอบว่าเป็นคำสั่งจากแอดมินหรือไม่
-    if user_id == ADMIN_USER_ID:
-        # คำสั่งเพิ่มนามแฝง
-        if text.lower().startswith("alias:"):
-            try:
-                # แยกส่วนคำสั่ง: alias: ชื่อจริง = ชื่อเล่น
-                command_body = text[len("alias:"):].strip()
-                original_name, nickname = [part.strip() for part in command_body.split('=', 1)]
-                
-                success, message = add_alias_to_sheet(original_name, nickname)
-                reply_text = message
-            except ValueError:
-                reply_text = "รูปแบบคำสั่งผิดพลาด\nกรุณใช้: alias: ชื่อจริง = ชื่อเล่น"
-            except Exception as e:
-                reply_text = f"เกิดข้อผิดพลาด: {e}"
-            
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-
-        # คำสั่ง Reload (ยังคงไว้)
-        elif text.lower() == "reload aliases":
-            global _aliases_cache
-            _aliases_cache = None
-            get_aliases()
-            reply_text = f"โหลดข้อมูลนามแฝงใหม่ {_aliases_cache.__len__()} รายการสำเร็จ!"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-
-    # คำสั่งปลุกบอท (สำหรับผู้ใช้ทุกคน)
-    if text.lower() in ["ping", "wake up", "ตื่น", "หวัดดี", "สวัสดี"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="ระบบพร้อมทำงานแล้วครับ! 🏓"))
-
-# (โค้ดส่วนที่เหลือทั้งหมดเหมือนเดิม ไม่ต้องแก้ไข)
-# ... (Route, Image handler, Join/Follow handlers, etc.) ...
 @app.route("/", methods=['GET', 'HEAD'])
 def home():
     return "OK", 200
@@ -171,36 +201,32 @@ def callback():
         abort(400)
     return 'OK'
 
-@handler.add(MessageEvent, message=ImageMessage)
-def handle_image_message(event):
-    source_id = event.source.sender_id
-    if not is_approved(source_id):
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="บอทกำลังรอการอนุมัติจากผู้ดูแลระบบครับ"))
-        return
-    message_content = line_bot_api.get_message_content(event.message.id)
-    url_api = "https://api.ocr.space/parse/image"
-    response = requests.post(url_api, 
-        files={"image": ("receipt.jpg", message_content.content, "image/jpeg")},
-        data={"apikey": OCR_SPACE_API_KEY, "language": "tha", "OCREngine": "2"}
-    )
-    result = response.json()
-    if result.get("IsErroredOnProcessing") == False and result.get("ParsedResults"):
-        detected_text = result["ParsedResults"][0]["ParsedText"]
-        parsed_data = parse_slip(detected_text)
-        aliases = get_aliases()
-        display_account = aliases.get(parsed_data['account'], parsed_data['account'])
-        display_recipient = aliases.get(parsed_data['recipient'], parsed_data['recipient'])
-        reply_text = (
-            f"สรุปรายการ:\n"
-            f"-------------------\n"
-            f"วันที่: {parsed_data['date']}\n"
-            f"จาก: {display_account}\n"
-            f"ถึง: {display_recipient}\n"
-            f"จำนวน: {parsed_data['amount']} บาท"
-        )
-    else:
-        reply_text = "ขออภัยครับ ไม่สามารถอ่านข้อความจากรูปภาพได้"
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+@handler.add(MessageEvent, message=TextMessage)
+def handle_text_message(event):
+    text = event.message.text
+    user_id = event.source.user_id
+    if user_id == ADMIN_USER_ID:
+        if text.lower().startswith("alias:"):
+            try:
+                command_body = text[len("alias:"):].strip()
+                original_name, nickname = [part.strip() for part in command_body.split('=', 1)]
+                success, message = add_alias_to_sheet(original_name, nickname)
+                reply_text = message
+            except ValueError:
+                reply_text = "รูปแบบคำสั่งผิดพลาด\nกรุณใช้: alias: ชื่อจริง = ชื่อเล่น"
+            except Exception as e:
+                reply_text = f"เกิดข้อผิดพลาด: {e}"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            return
+        elif text.lower() == "reload aliases":
+            global _aliases_cache
+            _aliases_cache = None
+            get_aliases()
+            reply_text = f"โหลดข้อมูลนามแฝงใหม่ {_aliases_cache.__len__()} รายการสำเร็จ!"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            return
+    if text.lower() in ["ping", "wake up", "ตื่น", "หวัดดี", "สวัสดี"]:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="ระบบพร้อมทำงานแล้วครับ! 🏓"))
 
 @handler.add(JoinEvent)
 def handle_join(event):
