@@ -6,7 +6,22 @@ from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ... (ส่วนตั้งค่าเหมือนเดิม) ...
+# ===================================================================
+# ส่วนที่ผมเผลอลบไป และได้นำกลับมาใส่ให้ถูกต้องแล้วครับ
+# ===================================================================
+from linebot import (
+    LineBotApi, WebhookHandler
+)
+from linebot.exceptions import (
+    InvalidSignatureError
+)
+from linebot.models import (
+    MessageEvent, ImageMessage, TextSendMessage,
+    JoinEvent, FollowEvent, SourceUser, SourceGroup
+)
+# ===================================================================
+
+# --- ส่วนตั้งค่า ---
 CHANNEL_ACCESS_TOKEN = os.environ.get('CHANNEL_ACCESS_TOKEN')
 CHANNEL_SECRET = os.environ.get('CHANNEL_SECRET')
 OCR_SPACE_API_KEY = os.environ.get('OCR_SPACE_API_KEY')
@@ -16,6 +31,7 @@ GOOGLE_SHEET_NAME = os.environ.get('GOOGLE_SHEET_NAME', "LineBotAccessControl")
 
 # --- ส่วนเริ่มต้นโปรแกรม ---
 app = Flask(__name__)
+# บรรทัดนี้จะกลับมาทำงานได้ปกติแล้ว
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 worksheet = None
@@ -60,8 +76,7 @@ def connect_to_google_sheets():
 # เรียกใช้ฟังก์ชันเชื่อมต่อตอนเริ่มต้นแอป
 connect_to_google_sheets()
 
-# (ส่วนที่เหลือของโค้ดทั้งหมดเหมือนเดิม ไม่ต้องแก้ไข)
-# ... (ตั้งแต่ def is_approved(source_id): เป็นต้นไป) ...
+# (โค้ดส่วนที่เหลือทั้งหมดถูกต้องอยู่แล้วครับ)
 # --- ฟังก์ชันตรวจสอบสิทธิ์ ---
 def is_approved(source_id):
     if not worksheet: return False
