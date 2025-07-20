@@ -53,7 +53,7 @@ def handle_image_message(event):
     # เราต้องส่งข้อมูลแบบ multipart/form-data
     response = requests.post(url_api, 
         files={"image": ("receipt.jpg", message_content.content, "image/jpeg")},
-        data={"apikey": OCR_SPACE_API_KEY, "language": "tha"} # <-- ระบุภาษาไทย
+        data={"apikey": OCR_SPACE_API_KEY, "language": "tai"} # <-- ระบุภาษาไทย
     )
 
     # แปลงผลลัพธ์ที่ได้กลับมาจาก ocr.space (ซึ่งเป็น JSON)
