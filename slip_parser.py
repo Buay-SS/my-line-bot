@@ -27,70 +27,68 @@ def find_amount(text):
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             return float(match.group(1).replace(',', ''))
-    
     all_amounts = [float(amount.replace(',', '')) for amount in re.findall(r'(\d{1,3}(?:,\d{3})*\.\d{2})', text)]
     return max(all_amounts) if all_amounts else None
 
 # --- Parser เฉพาะสำหรับแต่ละธนาคาร ---
 
 def _parse_kbank_slip(text):
-    # (ฟังก์ชันนี้ทำงานได้ดีแล้ว ไม่ต้องแก้ไข)
     data = {}
     account_match = re.search(r'(?:น\.ส\.|นาย)\s+(.*?)\n', text)
-    if account_match:
-        data['account'] = account_match.group(1).strip()
-    if "TrueMoney Wallet" in text:
-        data['recipient'] = "TrueMoney Wallet"
-    elif "ShopeePay" in text or "รี Shopee" in text:
-        data['recipient'] = "ShopeePay"
+    if account_match: data['account'] = account_match.group(1).strip()
+    if "TrueMoney Wallet" in text: data['recipient'] = "TrueMoney Wallet"
+    elif "ShopeePay" in text or "รี Shopee" in text: data['recipient'] = "ShopeePay"
     else:
         recipient_match = re.search(r'Prompt\s*Pay\s*\n(.*?)\n', text, re.MULTILINE)
-        if recipient_match:
-            data['recipient'] = recipient_match.group(1).strip()
+        if recipient_match: data['recipient'] = recipient_match.group(1).strip()
     return data
 
 def _parse_scb_slip(text):
-    # (ยังไม่ได้ทดสอบ แต่ตรรกะยังคงเดิม)
+    # (ตรรกะนี้อาจจะต้องปรับปรุงในอนาคต แต่เก็บไว้ก่อน)
     data = {}
     from_match = re.search(r'จาก\s*\n(.*?)\n', text, re.MULTILINE)
-    if from_match:
-        data['account'] = from_match.group(1).strip()
+    if from_match: data['account'] = from_match.group(1).strip()
     to_match = re.search(r'ไปยัง\s*\n(.*?)\n', text, re.MULTILINE)
-    if to_match:
-        data['recipient'] = to_match.group(1).strip()
+    if to_match: data['recipient'] = to_match.group(1).strip()
     return data
 
 def _parse_bbl_slip(text):
-    """Parser สำหรับ BBL ที่แก้ไขใหม่โดยใช้เทคนิค 'การหั่นข้อความ'"""
+    """Parser สำหรับ BBL ที่ใช้ 'ตรรกะตามลำดับตำแหน่ง' (Proximity Logic)"""
     data = {}
     try:
-        # หาตำแหน่งของคำสำคัญ
-        from_index = text.find('จาก')
-        to_index = text.find('ไปที่')
-        fee_index = text.find('ค่าธรรมเนียม')
+        # 1. หาตำแหน่งของ Keywords
+        from_keyword_index = text.find('จาก')
+        to_keyword_index = text.find('ไปที่')
+        
+        # 2. ค้นหา "ชื่อ" ทั้งหมดพร้อมตำแหน่ง
+        name_pattern = re.compile(r'(นาย|นาง|น\.ส\.)\s+[^\n]+')
+        all_names = [(match.group(0).strip(), match.start()) for match in name_pattern.finditer(text)]
 
-        # ตรวจสอบว่าเจอคำสำคัญที่จำเป็นหรือไม่
-        if from_index != -1 and to_index != -1:
-            # "หั่น" ส่วนของผู้โอนออกมา (คือข้อความระหว่าง "จาก" และ "ไปที่")
-            from_block = text[from_index:to_index]
+        # 3. คำนวณหาชื่อที่อยู่ใกล้ที่สุด
+        closest_from_name, closest_to_name = None, None
+        min_from_dist, min_to_dist = float('inf'), float('inf')
+
+        for name, name_index in all_names:
+            # หาชื่อที่ใกล้ "จาก" ที่สุด
+            if from_keyword_index != -1 and name_index > from_keyword_index:
+                dist = name_index - from_keyword_index
+                if dist < min_from_dist:
+                    min_from_dist = dist
+                    closest_from_name = name
             
-            # "หั่น" ส่วนของผู้รับออกมา (คือข้อความระหว่าง "ไปที่" และ "ค่าธรรมเนียม")
-            to_block_end_index = fee_index if fee_index != -1 else len(text)
-            to_block = text[to_index:to_block_end_index]
+            # หาชื่อที่ใกล้ "ไปที่" ที่สุด
+            if to_keyword_index != -1 and name_index > to_keyword_index:
+                dist = name_index - to_keyword_index
+                if dist < min_to_dist:
+                    min_to_dist = dist
+                    closest_to_name = name
 
-            # ค้นหาชื่อจากบล็อกที่หั่นออกมาแล้ว
-            from_name_match = re.search(r'(นาย|นาง|น\.ส\.)\s+([^\n]+)', from_block)
-            if from_name_match:
-                data['account'] = from_name_match.group(0).strip()
-
-            to_name_match = re.search(r'(นาย|นาง|น\.ส\.)\s+([^\n]+)', to_block)
-            if to_name_match:
-                data['recipient'] = to_name_match.group(0).strip()
+        data['account'] = closest_from_name
+        data['recipient'] = closest_to_name
     except Exception as e:
-        print(f"BBL Parser (slicing method) failed: {e}")
+        print(f"BBL Parser (proximity logic) failed: {e}")
         
     return data
-
 
 # --- ฟังก์ชันหลัก (ตัวจัดการ/Router - ไม่ต้องแก้ไข) ---
 def parse_slip(text):
