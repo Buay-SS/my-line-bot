@@ -1,7 +1,7 @@
 import re
 from datetime import datetime
 
-# --- พจนานุกรมและฟังก์ชันช่วยเหลือ (เหมือนเดิม แต่ปรับปรุง) ---
+# --- พจนานุกรมและฟังก์ชันช่วยเหลือ (ไม่มีการเปลี่ยนแปลง) ---
 THAI_MONTH_MAP = {
     'ม.ค.': 1, 'ก.พ.': 2, 'มี.ค.': 3, 'เม.ย.': 4, 'พ.ค.': 5, 'มิ.ย.': 6,
     'ก.ค.': 7, 'ส.ค.': 8, 'ก.ย.': 9, 'ต.ค.': 10, 'พ.ย.': 11, 'ธ.ค.': 12
@@ -12,21 +12,13 @@ def normalize_date(day_str, month_str, year_str):
         day = int(day_str)
         month = THAI_MONTH_MAP.get(month_str.replace('.', '').strip())
         year = int(year_str)
-
-        if year < 100:  # กรณีปีเป็น 2 หลัก เช่น 68
-            year += 2500
-        
-        if year > 2500: # ถ้าเป็น พ.ศ. ให้แปลงเป็น ค.ศ.
-            year -= 543
-        
-        # ส่งคืนเป็น YYYY-MM-DD ซึ่งเป็นรูปแบบมาตรฐาน
+        if year < 100: year += 2500
+        if year > 2500: year -= 543
         return f"{year:04d}-{month:02d}-{day:02d}"
-    except (ValueError, TypeError, AttributeError):
-        return 'N/A'
+    except:
+        return None
 
 def find_amount(text):
-    # Regex ที่ดีขึ้น: มองหา "จำนวน" หรือ "Amount" แล้วตามด้วยตัวเลข
-    # หรือมองหาตัวเลขที่มี .00 THB ต่อท้าย
     patterns = [
         r'(?:จำนวน|Amount)[\s:]*([,\d]+\.\d{2})',
         r'([,\d]+\.\d{2})\s*THB'
@@ -36,85 +28,69 @@ def find_amount(text):
         if match:
             return float(match.group(1).replace(',', ''))
     
-    # Fallback: ถ้าไม่เจอจากคำสำคัญ ให้หาตัวเลข .00 ที่ใหญ่ที่สุด
     all_amounts = [float(amount.replace(',', '')) for amount in re.findall(r'(\d{1,3}(?:,\d{3})*\.\d{2})', text)]
-    if all_amounts:
-        return max(all_amounts)
-        
-    return 'N/A'
+    return max(all_amounts) if all_amounts else None
 
-# --- Parser เฉพาะสำหรับแต่ละธนาคาร ---
+# --- Parser เฉพาะสำหรับแต่ละธนาคาร (แก้ไขใหม่!) ---
 
 def _parse_kbank_slip(text):
-    """Parser สำหรับสลิปจาก K+/KBank โดยเฉพาะ"""
-    data = {'date': 'N/A', 'amount': 'N/A', 'recipient': 'N/A', 'account': 'N/A'}
-
-    # ผู้โอน: มองหา "น.ส./นาย" แล้วเอาเฉพาะชื่อข้างหลัง
+    """Parser สำหรับ KBank จะหาแค่ 'account' กับ 'recipient'"""
+    # <-- เปลี่ยน: เริ่มต้นด้วย dict ว่าง
+    data = {}
+    
     account_match = re.search(r'(?:น\.ส\.|นาย)\s+(.*?)\n', text)
     if account_match:
         data['account'] = account_match.group(1).strip()
 
-    # ผู้รับ: ตรวจสอบจาก Keyword ที่ชัดเจนก่อน
     if "TrueMoney Wallet" in text:
         data['recipient'] = "TrueMoney Wallet"
     elif "ShopeePay" in text or "รี Shopee" in text:
         data['recipient'] = "ShopeePay"
     else:
-        # ถ้าไม่ใช่ e-wallet ให้หาจาก PromptPay
         recipient_match = re.search(r'Prompt\s*Pay\s*\n(.*?)\n', text, re.MULTILINE)
         if recipient_match:
             data['recipient'] = recipient_match.group(1).strip()
             
-    return data
+    return data # <-- จะ return กลับไปแค่ข้อมูลที่หาเจอจริงๆ
 
 def _parse_scb_slip(text):
-    """Parser สำหรับสลิปจาก SCB โดยเฉพาะ"""
-    data = {'date': 'N/A', 'amount': 'N/A', 'recipient': 'N/A', 'account': 'N/A'}
-
+    """Parser สำหรับ SCB จะหาแค่ 'account' กับ 'recipient'"""
+    data = {}
     from_match = re.search(r'จาก\s*\n(.*?)\n', text, re.MULTILINE)
     if from_match:
         data['account'] = from_match.group(1).strip()
-
     to_match = re.search(r'ไปยัง\s*\n(.*?)\n', text, re.MULTILINE)
     if to_match:
         data['recipient'] = to_match.group(1).strip()
-        
     return data
 
 def _parse_bbl_slip(text):
-    """Parser สำหรับสลิปจาก Bangkok Bank โดยเฉพาะ"""
-    data = {'date': 'N/A', 'amount': 'N/A', 'recipient': 'N/A', 'account': 'N/A'}
-
+    """Parser สำหรับ BBL จะหาแค่ 'account' กับ 'recipient'"""
+    data = {}
     from_match = re.search(r'จาก\s*\n(.*?)\n', text, re.MULTILINE)
     if from_match:
         data['account'] = from_match.group(1).strip()
-
     to_match = re.search(r'ไปที่\s*\n(.*?)\n', text, re.MULTILINE)
     if to_match:
         data['recipient'] = to_match.group(1).strip()
-        
     return data
 
-
-# --- ฟังก์ชันหลัก (ตัวจัดการ/Router) ---
+# --- ฟังก์ชันหลัก (ตัวจัดการ/Router - แก้ไขใหม่!) ---
 
 def parse_slip(text):
-    """
-    ฟังก์ชันหลักที่จะวิเคราะห์ข้อความดิบ, ตรวจสอบว่าเป็นสลิปจากธนาคารไหน,
-    แล้วเรียกใช้ Parser เฉพาะทางที่เหมาะสม
-    """
-    # 1. หาข้อมูลพื้นฐานที่มักจะเหมือนกันในทุกสลิป
-    base_data = {}
-    
-    # ค้นหาวันที่: รูปแบบ "dd เดือน yy"
+    # <-- เปลี่ยน: สร้าง dict สุดท้ายที่นี่ พร้อมค่าเริ่มต้น
+    final_data = {'date': 'N/A', 'amount': 'N/A', 'recipient': 'N/A', 'account': 'N/A'}
+
+    # 1. หาข้อมูลพื้นฐานก่อน
     date_match = re.search(r'(\d{1,2})\s+(ม\.ค\.|ก\.พ\.|มี\.ค\.|เม\.ย\.|พ\.ค\.|มิ\.ย\.|ก\.ค\.|ส\.ค\.|ก\.ย\.|ต\.ค\.|พ\.ย\.|ธ\.ค\.)\s+(\d{2,4})', text)
     if date_match:
-        base_data['date'] = normalize_date(date_match.group(1), date_match.group(2), date_match.group(3))
+        # <-- เปลี่ยน: อัปเดต final_data โดยตรง
+        final_data['date'] = normalize_date(date_match.group(1), date_match.group(2), date_match.group(3))
 
-    # ค้นหาจำนวนเงิน
-    base_data['amount'] = find_amount(text)
-    
-    # 2. ตรวจสอบว่าเป็นสลิปของธนาคารไหน แล้วเรียกใช้ Parser เฉพาะทาง
+    # <-- เปลี่ยน: อัปเดต final_data โดยตรง
+    final_data['amount'] = find_amount(text)
+
+    # 2. ตรวจสอบว่าเป็นสลิปของธนาคารไหน
     specific_data = {}
     if "K+" in text or "กสิกรไทย" in text:
         specific_data = _parse_kbank_slip(text)
@@ -122,18 +98,13 @@ def parse_slip(text):
         specific_data = _parse_scb_slip(text)
     elif "Bangkok Bank" in text:
         specific_data = _parse_bbl_slip(text)
-    # (คุณสามารถเพิ่ม elif สำหรับธนาคารอื่นๆ ได้ที่นี่ในอนาคต)
-    else:
-        # ถ้าไม่สามารถระบุธนาคารได้
-        print("Could not identify the bank from the slip.")
+    
+    # 3. รวมผลลัพธ์ โดยข้อมูลจาก specific_data จะเขียนทับถ้ามี
+    final_data.update(specific_data)
 
-    # 3. รวมผลลัพธ์จากข้อมูลพื้นฐานและข้อมูลเฉพาะทางเข้าด้วยกัน
-    # โดยจะยึดข้อมูลจาก Parser เฉพาะทางเป็นหลักถ้ามี
-    final_data = {**base_data, **specific_data}
-
-    # 4. ตรวจสอบและทำความสะอาดข้อมูลครั้งสุดท้าย
+    # 4. ทำความสะอาดข้อมูลครั้งสุดท้าย (แปลง None เป็น 'N/A')
     for key, value in final_data.items():
-        if value is None or value == '':
-            final_data[key] = 'N/A' # N/A = Not Available
+        if value is None:
+            final_data[key] = 'N/A'
             
     return final_data
