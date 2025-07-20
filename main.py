@@ -2,6 +2,9 @@ import os
 import json
 from flask import Flask, request, abort
 import requests
+from datetime import datetime
+import gspread # <-- Library ใหม่สำหรับ Google Sheets
+from google.oauth2.service_account import Credentials
 
 from linebot import (
     LineBotApi, WebhookHandler
@@ -11,64 +14,139 @@ from linebot.exceptions import (
 )
 from linebot.models import (
     MessageEvent, ImageMessage, TextSendMessage,
+    JoinEvent, FollowEvent, SourceUser, SourceGroup
 )
 
 # --- ส่วนตั้งค่า ---
 CHANNEL_ACCESS_TOKEN = os.environ.get('CHANNEL_ACCESS_TOKEN')
 CHANNEL_SECRET = os.environ.get('CHANNEL_SECRET')
-OCR_SPACE_API_KEY = os.environ.get('OCR_SPACE_API_KEY') 
+OCR_SPACE_API_KEY = os.environ.get('OCR_SPACE_API_KEY')
+# --- ตัวแปรใหม่สำหรับระบบอนุมัติ ---
+ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID') # ID Line ส่วนตัวของคุณ
+GOOGLE_CREDENTIALS_JSON_STRING = os.environ.get('GOOGLE_CREDENTIALS_JSON') # JSON Key จาก Google
+GOOGLE_SHEET_NAME = "LineBotAccessControl" # ชื่อไฟล์ Google Sheet ที่คุณสร้าง
 
 # --- ส่วนเริ่มต้นโปรแกรม ---
 app = Flask(__name__)
-
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
+# --- ตั้งค่าการเชื่อมต่อ Google Sheets ---
+try:
+    credentials_info = json.loads(GOOGLE_CREDENTIALS_JSON_STRING)
+    scopes = ['https://www.googleapis.com/auth/spreadsheets']
+    credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
+    gc = gspread.authorize(credentials)
+    worksheet = gc.open(GOOGLE_SHEET_NAME).sheet1
+    print("Successfully connected to Google Sheets.")
+except Exception as e:
+    print(f"Error connecting to Google Sheets: {e}")
+    worksheet = None
 
-# --- ส่วน Webhook ที่จะรับข้อมูลจาก LINE ---
+# --- ฟังก์ชันตรวจสอบสิทธิ์ ---
+def is_approved(source_id):
+    if not worksheet: return False
+    try:
+        cell = worksheet.find(source_id) # ค้นหา ID ในชีท
+        if cell:
+            # ตรวจสอบคอลัมน์ Status (คอลัมน์ที่ 4) ในแถวที่เจอ
+            status = worksheet.cell(cell.row, 4).value
+            return status.lower() == 'approved'
+        return False
+    except Exception as e:
+        print(f"Error checking approval status: {e}")
+        return False
+
+# --- ฟังก์ชันบันทึกผู้ใช้/กลุ่มใหม่ ---
+def register_source(source_id, display_name, source_type):
+    if not worksheet: return
+    try:
+        # เช็คก่อนว่ามี ID นี้อยู่แล้วหรือยัง
+        if not worksheet.find(source_id):
+            new_row = [source_id, display_name, source_type, 'pending', datetime.now().isoformat()]
+            worksheet.append_row(new_row)
+            # แจ้งเตือนแอดมิน
+            if ADMIN_USER_ID:
+                line_bot_api.push_message(
+                    ADMIN_USER_ID,
+                    TextSendMessage(text=f"New {source_type} needs approval:\nName: {display_name}\nID: {source_id}")
+                )
+    except Exception as e:
+        print(f"Error registering source: {e}")
+
+# --- Event: เมื่อมีคนส่งรูปภาพ (เพิ่มระบบเช็คสิทธิ์) ---
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image_message(event):
+    source_id = event.source.sender_id
+    
+    if is_approved(source_id):
+        # --- ถ้าได้รับอนุมัติแล้ว: ทำงานเหมือนเดิม ---
+        message_content = line_bot_api.get_message_content(event.message.id)
+        url_api = "https://api.ocr.space/parse/image"
+        response = requests.post(url_api, 
+            files={"image": ("receipt.jpg", message_content.content, "image/jpeg")},
+            data={"apikey": OCR_SPACE_API_KEY, "language": "tha", "OCREngine": "2"}
+        )
+        result = response.json()
+        if result.get("IsErroredOnProcessing") == False and result.get("ParsedResults"):
+            detected_text = result["ParsedResults"][0]["ParsedText"]
+            reply_text = "ข้อความที่อ่านได้จากรูปภาพ:\n\n" + detected_text
+        else:
+            error_message = result.get("ErrorMessage", ["เกิดข้อผิดพลาด"])[0]
+            reply_text = f"ขออภัยครับ ไม่สามารถอ่านข้อความได้: {error_message}"
+    else:
+        # --- ถ้ายังไม่ได้รับอนุมัติ ---
+        reply_text = "บอทกำลังรอการอนุมัติจากผู้ดูแลระบบครับ โปรดติดต่อผู้สร้างบอท"
+
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+
+# --- Event: เมื่อบอทถูกเชิญเข้ากลุ่ม (ใหม่) ---
+@handler.add(JoinEvent)
+def handle_join(event):
+    if isinstance(event.source, SourceGroup):
+        group_id = event.source.group_id
+        try:
+            # ดึงชื่อกลุ่ม (อาจไม่สำเร็จถ้าบอทไม่มีสิทธิ์)
+            group_summary = line_bot_api.get_group_summary(group_id)
+            group_name = group_summary.group_name
+        except:
+            group_name = "Unknown Group"
+        register_source(group_id, group_name, 'group')
+        # ตอบกลับในกลุ่มเพื่อแจ้งสถานะ
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="สวัสดีครับ! บอทนี้กำลังรอการอนุมัติจากผู้ดูแลระบบเพื่อเริ่มใช้งานในกลุ่มนี้ครับ")
+        )
+
+# --- Event: เมื่อมีคนแอดบอทเป็นเพื่อน (ใหม่) ---
+@handler.add(FollowEvent)
+def handle_follow(event):
+    if isinstance(event.source, SourceUser):
+        user_id = event.source.user_id
+        try:
+            # ดึงโปรไฟล์ผู้ใช้
+            profile = line_bot_api.get_profile(user_id)
+            display_name = profile.display_name
+        except:
+            display_name = "Unknown User"
+        register_source(user_id, display_name, 'user')
+        # ตอบกลับหาผู้ใช้เพื่อแจ้งสถานะ
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="ขอบคุณที่เพิ่มเป็นเพื่อนครับ! ขณะนี้กำลังรอการอนุมัติจากผู้ดูแลระบบเพื่อเริ่มใช้งานครับ")
+        )
+
+# --- Webhook Callback (เหมือนเดิม) ---
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
     return 'OK'
-
-# --- ส่วนจัดการ Event เมื่อผู้ใช้ส่ง "รูปภาพ" ---
-@handler.add(MessageEvent, message=ImageMessage)
-def handle_image_message(event):
-    message_content = line_bot_api.get_message_content(event.message.id)
     
-    url_api = "https://api.ocr.space/parse/image"
-
-    # ส่งรูปภาพไปให้ ocr.space API พร้อมระบุ Engine 2
-    response = requests.post(url_api, 
-        files={"image": ("receipt.jpg", message_content.content, "image/jpeg")},
-        data={
-            "apikey": OCR_SPACE_API_KEY,
-            "language": "tha", # รหัสภาษาไทยที่ถูกต้อง
-            "OCREngine": "2"   # ระบุให้ใช้ Engine 2 ที่รองรับภาษาไทย
-        }
-    )
-
-    result = response.json()
-
-    if result.get("IsErroredOnProcessing") == False and result.get("ParsedResults"):
-        detected_text = result["ParsedResults"][0]["ParsedText"]
-        reply_text = "ข้อความที่อ่านได้จากรูปภาพ (โดย ocr.space):\n\n" + detected_text
-    else:
-        error_message = result.get("ErrorMessage", ["เกิดข้อผิดพลาดไม่ทราบสาเหตุ"])[0]
-        reply_text = f"ขออภัยครับ ไม่สามารถอ่านข้อความได้: {error_message}"
-
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply_text)
-    )
-
-# --- ส่วนสำหรับรัน Flask App ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
