@@ -8,12 +8,12 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from linebot import (LineBotApi, WebhookHandler)
-from linebot.exceptions import (InvalidSignatureError)
+from linebot.exceptions import (InvalidSignatureError, LineBotApiError) # เพิ่ม LineBotApiError
 from linebot.models import (MessageEvent, ImageMessage, TextSendMessage, JoinEvent, FollowEvent, SourceUser, SourceGroup, TextMessage)
 
 from slip_parser import parse_slip
 
-# --- ส่วนตั้งค่า (เหมือนเดิม) ---
+# (โค้ดส่วนตั้งค่า และส่วนเริ่มต้นโปรแกรม เหมือนเดิมทั้งหมด)
 CHANNEL_ACCESS_TOKEN = os.environ.get('CHANNEL_ACCESS_TOKEN')
 CHANNEL_SECRET = os.environ.get('CHANNEL_SECRET')
 OCR_SPACE_API_KEY = os.environ.get('OCR_SPACE_API_KEY')
@@ -21,18 +21,17 @@ ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID')
 GOOGLE_CREDENTIALS_JSON_STRING = os.environ.get('GOOGLE_CREDENTIALS_JSON')
 GOOGLE_SHEET_ID = os.environ.get('GOOGLE_SHEET_ID')
 
-# --- ส่วนเริ่มต้นโปรแกรม (เหมือนเดิม) ---
 app = Flask(__name__)
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# --- ระบบจัดการการเชื่อมต่อและ Cache (เหมือนเดิม) ---
 _spreadsheet = None
 _aliases_cache = None
 
 def get_spreadsheet():
     global _spreadsheet
     if _spreadsheet: return _spreadsheet
+    # ... (โค้ดส่วนนี้เหมือนเดิม)
     print("--- Connecting to Google Spreadsheet... ---")
     try:
         scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file']
@@ -48,6 +47,7 @@ def get_spreadsheet():
 def get_aliases():
     global _aliases_cache
     if _aliases_cache is not None: return _aliases_cache
+    # ... (โค้ดส่วนนี้เหมือนเดิม)
     print("--- Reading aliases... ---")
     spreadsheet = get_spreadsheet()
     if not spreadsheet:
@@ -65,7 +65,7 @@ def get_aliases():
         return _aliases_cache
 
 # =========================================================
-#  **ฟังก์ชันใหม่ล่าสุด: บันทึกรายการลงชีท Transactions**
+#  **อัปเกรดฟังก์ชันบันทึกรายการ ให้รับชื่อโปรไฟล์ด้วย**
 # =========================================================
 def log_transaction_to_sheet(log_data):
     spreadsheet = get_spreadsheet()
@@ -73,32 +73,46 @@ def log_transaction_to_sheet(log_data):
         return False, "ไม่สามารถเชื่อมต่อกับฐานข้อมูล (Sheet) ได้"
     try:
         worksheet = spreadsheet.worksheet("Transactions")
-        
-        # สร้าง Timestamp เวลาประเทศไทย (UTC+7)
         thai_tz = timezone(timedelta(hours=7))
         timestamp = datetime.now(thai_tz).strftime("%Y-%m-%d %H:%M:%S")
         
+        # เพิ่ม recorded_by_name เข้าไปในแถวใหม่
         new_row = [
             timestamp,
             log_data.get('date', 'N/A'),
             log_data.get('from', 'N/A'),
             log_data.get('to', 'N/A'),
             log_data.get('amount', 0.0),
-            log_data.get('recorded_by', 'N/A')
+            log_data.get('recorded_by_id', 'N/A'),
+            log_data.get('recorded_by_name', 'N/A') # <-- คอลัมน์ใหม่
         ]
         worksheet.append_row(new_row, value_input_option='USER_ENTERED')
-        print(f"--- Successfully logged transaction for {log_data.get('recorded_by')} ---")
+        print(f"--- Successfully logged transaction for {log_data.get('recorded_by_id')} ---")
         return True, "บันทึกรายการเรียบร้อย!"
     except Exception as e:
         print(f"--- ERROR logging transaction: {e} ---")
         return False, "เกิดข้อผิดพลาดในการบันทึกข้อมูล"
 
 
-# --- Event Handler: รูปภาพ (อัปเกรดครั้งสุดท้าย!) ---
+# =========================================================
+#  **อัปเกรด handle_image_message ให้ดึงชื่อโปรไฟล์**
+# =========================================================
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
-    source_id = event.source.sender_id
-    if not is_approved(source_id):
+    source = event.source
+    user_id = source.user_id
+    
+    # ดึง Profile Name (จะทำงานได้เฉพาะในแชทส่วนตัว)
+    profile_name = "N/A (Group Chat)"
+    if isinstance(source, SourceUser):
+        try:
+            profile = line_bot_api.get_profile(user_id)
+            profile_name = profile.display_name
+        except LineBotApiError as e:
+            print(f"Cannot get profile for {user_id}: {e}")
+            profile_name = "N/A (API Error)"
+
+    if not is_approved(user_id):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="บอทกำลังรอการอนุมัติจากผู้ดูแลระบบครับ"))
         return
 
@@ -127,18 +141,16 @@ def handle_image_message(event):
             f"จำนวน: {parsed_data.get('amount', 'N/A')} บาท"
         )
 
-        # --- ส่วนของการบันทึกข้อมูล ---
         log_data = {
             'date': parsed_data.get('date', 'N/A'),
             'from': display_account,
             'to': display_recipient,
             'amount': parsed_data.get('amount', 0.0),
-            'recorded_by': source_id
+            'recorded_by_id': user_id,
+            'recorded_by_name': profile_name # <-- ส่งชื่อโปรไฟล์ไปด้วย
         }
         log_success, log_message = log_transaction_to_sheet(log_data)
-        # -------------------------
-
-        # เพิ่มสถานะการบันทึกลงในข้อความตอบกลับ
+        
         final_reply_text = f"{summary_text}\n-------------------\nสถานะ: {log_message}"
 
     else:
@@ -171,10 +183,14 @@ def is_approved(source_id):
     spreadsheet = get_spreadsheet()
     if not spreadsheet: return False
     try:
+        # ในกลุ่ม จะใช้ group_id, ในแชทเดี่ยวจะใช้ user_id
+        # แต่เราบันทึก source_id ลงไปใน Sheet1 ซึ่งอาจเป็นได้ทั้งสองอย่าง
         worksheet = spreadsheet.worksheet("Sheet1")
         cell = worksheet.find(source_id)
         return cell and worksheet.cell(cell.row, 4).value.lower() == 'approved'
-    except Exception as e: return False
+    except Exception as e: 
+        print(f"Error in is_approved: {e}")
+        return False
 
 def register_source(source_id, display_name, source_type):
     spreadsheet = get_spreadsheet()
