@@ -1,5 +1,4 @@
 flask
 gunicorn
 line-bot-sdk
-google-cloud-vision
-google-auth
+requests
