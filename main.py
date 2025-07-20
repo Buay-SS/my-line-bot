@@ -1,7 +1,7 @@
 import os
 import json
 from flask import Flask, request, abort
-import requests # <-- Library ใหม่ที่ต้องใช้
+import requests
 
 from linebot import (
     LineBotApi, WebhookHandler
@@ -14,16 +14,13 @@ from linebot.models import (
 )
 
 # --- ส่วนตั้งค่า ---
-# ดึงค่าจาก Environment Variables บน Render.com
 CHANNEL_ACCESS_TOKEN = os.environ.get('CHANNEL_ACCESS_TOKEN')
 CHANNEL_SECRET = os.environ.get('CHANNEL_SECRET')
-# เปลี่ยนมาใช้ Key ของ ocr.space แทน
 OCR_SPACE_API_KEY = os.environ.get('OCR_SPACE_API_KEY') 
 
 # --- ส่วนเริ่มต้นโปรแกรม ---
 app = Flask(__name__)
 
-# ตั้งค่า LINE Bot
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
@@ -40,42 +37,38 @@ def callback():
         abort(400)
     return 'OK'
 
-# --- ส่วนจัดการ Event เมื่อผู้ใช้ส่ง "รูปภาพ" (ผ่าตัดใหม่ทั้งหมด) ---
+# --- ส่วนจัดการ Event เมื่อผู้ใช้ส่ง "รูปภาพ" ---
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
-    # ดึงเนื้อหาของรูปภาพจาก LINE
     message_content = line_bot_api.get_message_content(event.message.id)
     
-    # URL ของ ocr.space API
     url_api = "https://api.ocr.space/parse/image"
 
-    # ส่งรูปภาพไปให้ ocr.space API
-    # เราต้องส่งข้อมูลแบบ multipart/form-data
+    # ส่งรูปภาพไปให้ ocr.space API พร้อมระบุ Engine 2
     response = requests.post(url_api, 
         files={"image": ("receipt.jpg", message_content.content, "image/jpeg")},
-        data={"apikey": OCR_SPACE_API_KEY, "language": "tai"} # <-- ระบุภาษาไทย
+        data={
+            "apikey": OCR_SPACE_API_KEY,
+            "language": "tha", # รหัสภาษาไทยที่ถูกต้อง
+            "OCREngine": "2"   # ระบุให้ใช้ Engine 2 ที่รองรับภาษาไทย
+        }
     )
 
-    # แปลงผลลัพธ์ที่ได้กลับมาจาก ocr.space (ซึ่งเป็น JSON)
     result = response.json()
 
-    # ตรวจสอบว่าการอ่านสำเร็จหรือไม่ และมีข้อความหรือไม่
     if result.get("IsErroredOnProcessing") == False and result.get("ParsedResults"):
-        # ดึงข้อความที่อ่านได้ออกมา
         detected_text = result["ParsedResults"][0]["ParsedText"]
         reply_text = "ข้อความที่อ่านได้จากรูปภาพ (โดย ocr.space):\n\n" + detected_text
     else:
-        # กรณีอ่านไม่สำเร็จ หรือไม่มีข้อความ
         error_message = result.get("ErrorMessage", ["เกิดข้อผิดพลาดไม่ทราบสาเหตุ"])[0]
         reply_text = f"ขออภัยครับ ไม่สามารถอ่านข้อความได้: {error_message}"
 
-    # ตอบกลับข้อความไปหาผู้ใช้
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text=reply_text)
     )
 
-# --- ส่วนสำหรับรัน Flask App (เหมือนเดิม) ---
+# --- ส่วนสำหรับรัน Flask App ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
