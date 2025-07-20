@@ -6,9 +6,6 @@ from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ===================================================================
-# ส่วนที่ผมเผลอลบไป และได้นำกลับมาใส่ให้ถูกต้องแล้วครับ
-# ===================================================================
 from linebot import (
     LineBotApi, WebhookHandler
 )
@@ -19,7 +16,6 @@ from linebot.models import (
     MessageEvent, ImageMessage, TextSendMessage,
     JoinEvent, FollowEvent, SourceUser, SourceGroup
 )
-# ===================================================================
 
 # --- ส่วนตั้งค่า ---
 CHANNEL_ACCESS_TOKEN = os.environ.get('CHANNEL_ACCESS_TOKEN')
@@ -27,42 +23,47 @@ CHANNEL_SECRET = os.environ.get('CHANNEL_SECRET')
 OCR_SPACE_API_KEY = os.environ.get('OCR_SPACE_API_KEY')
 ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID')
 GOOGLE_CREDENTIALS_JSON_STRING = os.environ.get('GOOGLE_CREDENTIALS_JSON')
-GOOGLE_SHEET_NAME = os.environ.get('GOOGLE_SHEET_NAME', "LineBotAccessControl")
+GOOGLE_SHEET_ID = os.environ.get('GOOGLE_SHEET_ID') # <-- ตัวแปรใหม่
 
 # --- ส่วนเริ่มต้นโปรแกรม ---
 app = Flask(__name__)
-# บรรทัดนี้จะกลับมาทำงานได้ปกติแล้ว
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 worksheet = None
 
-# --- ฟังก์ชันสำหรับเชื่อมต่อ Google Sheets (เวอร์ชันดีบัก) ---
+# --- ฟังก์ชันสำหรับเชื่อมต่อ Google Sheets (เวอร์ชันใช้ ID) ---
 def connect_to_google_sheets():
     global worksheet
-    print("--- Attempting to connect to Google Sheets ---")
+    print("--- Attempting to connect to Google Sheets using Sheet ID ---")
     try:
         if not GOOGLE_CREDENTIALS_JSON_STRING:
-            print("CRITICAL ERROR: GOOGLE_CREDENTIALS_JSON environment variable is not set.")
+            print("CRITICAL ERROR: GOOGLE_CREDENTIALS_JSON is not set.")
+            return
+        if not GOOGLE_SHEET_ID:
+            print("CRITICAL ERROR: GOOGLE_SHEET_ID is not set.")
             return
 
-        print("Step 1: Loading credentials from JSON string...")
-        credentials_info = json.loads(GOOGLE_CREDENTIALS_JSON_STRING)
-        print("Step 1: Success.")
-
-        print("Step 2: Creating credentials with scopes...")
+        print("Step 1 & 2: Loading credentials and scopes...")
         scopes = [
             'https://www.googleapis.com/auth/spreadsheets',
             'https://www.googleapis.com/auth/drive.file'
         ]
-        credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
-        print("Step 2: Success.")
+        credentials = Credentials.from_service_account_info(
+            json.loads(GOOGLE_CREDENTIALS_JSON_STRING), scopes=scopes
+        )
+        print("Step 1 & 2: Success.")
 
         print("Step 3: Authorizing gspread client...")
         gc = gspread.authorize(credentials)
         print("Step 3: Success.")
 
-        print(f"Step 4: Opening worksheet '{GOOGLE_SHEET_NAME}'...")
-        worksheet = gc.open(GOOGLE_SHEET_NAME).sheet1
+        print(f"Step 4: Opening worksheet by ID '{GOOGLE_SHEET_ID[:10]}...'...") # แสดง ID แค่บางส่วน
+        # =========================================================
+        # เปลี่ยนมาใช้ open_by_key แทน open
+        # =========================================================
+        spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
+        worksheet = spreadsheet.sheet1
+        # =========================================================
         print("Step 4: Success.")
         print("--- Successfully connected to Google Sheets! Worksheet is ready. ---")
 
@@ -76,7 +77,8 @@ def connect_to_google_sheets():
 # เรียกใช้ฟังก์ชันเชื่อมต่อตอนเริ่มต้นแอป
 connect_to_google_sheets()
 
-# (โค้ดส่วนที่เหลือทั้งหมดถูกต้องอยู่แล้วครับ)
+# (โค้ดส่วนที่เหลือทั้งหมดเหมือนเดิม ไม่ต้องแก้ไข)
+# ...
 # --- ฟังก์ชันตรวจสอบสิทธิ์ ---
 def is_approved(source_id):
     if not worksheet: return False
