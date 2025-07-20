@@ -61,26 +61,36 @@ def _parse_scb_slip(text):
     return data
 
 def _parse_bbl_slip(text):
-    """Parser สำหรับ BBL ที่แก้ไขให้ฉลาดขึ้น"""
+    """Parser สำหรับ BBL ที่แก้ไขใหม่โดยใช้เทคนิค 'การหั่นข้อความ'"""
     data = {}
-    # Regex ที่มองหา "บล็อก" ข้อมูลทั้งหมดของ "จาก" และ "ไปที่"
-    # (?:...) คือ non-capturing group, \s* คือ space 0 หรือมากกว่า, (.*?) คือการจับข้อความแบบไม่โลภ
-    from_block_match = re.search(r'จาก\s*(.*?)(?=\s*ไปที่|\s*ค่าธรรมเนียม)', text, re.DOTALL)
-    to_block_match = re.search(r'ไปที่\s*(.*?)(?=\s*ค่าธรรมเนียม|\s*หมายเลข)', text, re.DOTALL)
+    try:
+        # หาตำแหน่งของคำสำคัญ
+        from_index = text.find('จาก')
+        to_index = text.find('ไปที่')
+        fee_index = text.find('ค่าธรรมเนียม')
 
-    if from_block_match:
-        # ในบล็อก "จาก" ให้หาบรรทัดแรกที่เป็นชื่อคน
-        from_name_match = re.search(r'(นาย|นาง|น\.ส\.)\s+([^\n]+)', from_block_match.group(1))
-        if from_name_match:
-            data['account'] = from_name_match.group(0).strip()
-
-    if to_block_match:
-        # ในบล็อก "ไปที่" ให้หาบรรทัดแรกที่เป็นชื่อคน
-        to_name_match = re.search(r'(นาย|นาง|น\.ส\.)\s+([^\n]+)', to_block_match.group(1))
-        if to_name_match:
-            data['recipient'] = to_name_match.group(0).strip()
+        # ตรวจสอบว่าเจอคำสำคัญที่จำเป็นหรือไม่
+        if from_index != -1 and to_index != -1:
+            # "หั่น" ส่วนของผู้โอนออกมา (คือข้อความระหว่าง "จาก" และ "ไปที่")
+            from_block = text[from_index:to_index]
             
+            # "หั่น" ส่วนของผู้รับออกมา (คือข้อความระหว่าง "ไปที่" และ "ค่าธรรมเนียม")
+            to_block_end_index = fee_index if fee_index != -1 else len(text)
+            to_block = text[to_index:to_block_end_index]
+
+            # ค้นหาชื่อจากบล็อกที่หั่นออกมาแล้ว
+            from_name_match = re.search(r'(นาย|นาง|น\.ส\.)\s+([^\n]+)', from_block)
+            if from_name_match:
+                data['account'] = from_name_match.group(0).strip()
+
+            to_name_match = re.search(r'(นาย|นาง|น\.ส\.)\s+([^\n]+)', to_block)
+            if to_name_match:
+                data['recipient'] = to_name_match.group(0).strip()
+    except Exception as e:
+        print(f"BBL Parser (slicing method) failed: {e}")
+        
     return data
+
 
 # --- ฟังก์ชันหลัก (ตัวจัดการ/Router - ไม่ต้องแก้ไข) ---
 def parse_slip(text):
