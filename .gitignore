@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Google Cloud
+service_account.json
