@@ -44,7 +44,6 @@ def _parse_kbank_slip(text):
     return data
 
 def _parse_scb_slip(text):
-    # (ตรรกะนี้อาจจะต้องปรับปรุงในอนาคต แต่เก็บไว้ก่อน)
     data = {}
     from_match = re.search(r'จาก\s*\n(.*?)\n', text, re.MULTILINE)
     if from_match: data['account'] = from_match.group(1).strip()
@@ -53,40 +52,53 @@ def _parse_scb_slip(text):
     return data
 
 def _parse_bbl_slip(text):
-    """Parser สำหรับ BBL ที่ใช้ 'ตรรกะตามลำดับตำแหน่ง' (Proximity Logic)"""
+    """Parser สำหรับ BBL ที่ใช้ 'ตรรกะแบบคัดออก' (Exclusive Logic)"""
     data = {}
     try:
-        # 1. หาตำแหน่งของ Keywords
         from_keyword_index = text.find('จาก')
         to_keyword_index = text.find('ไปที่')
         
-        # 2. ค้นหา "ชื่อ" ทั้งหมดพร้อมตำแหน่ง
         name_pattern = re.compile(r'(นาย|นาง|น\.ส\.)\s+[^\n]+')
+        # สร้าง List ของ (ชื่อ, ตำแหน่ง) ขึ้นมาเพื่อให้แก้ไขได้
         all_names = [(match.group(0).strip(), match.start()) for match in name_pattern.finditer(text)]
 
-        # 3. คำนวณหาชื่อที่อยู่ใกล้ที่สุด
-        closest_from_name, closest_to_name = None, None
-        min_from_dist, min_to_dist = float('inf'), float('inf')
+        sender_name, recipient_name = None, None
 
-        for name, name_index in all_names:
-            # หาชื่อที่ใกล้ "จาก" ที่สุด
-            if from_keyword_index != -1 and name_index > from_keyword_index:
-                dist = name_index - from_keyword_index
-                if dist < min_from_dist:
-                    min_from_dist = dist
-                    closest_from_name = name
+        # --- ขั้นตอนที่ 1: หาผู้โอน ---
+        if from_keyword_index != -1:
+            min_dist = float('inf')
+            sender_candidate = None
+            for name, name_index in all_names:
+                if name_index > from_keyword_index:
+                    dist = name_index - from_keyword_index
+                    if dist < min_dist:
+                        min_dist = dist
+                        sender_candidate = (name, name_index)
             
-            # หาชื่อที่ใกล้ "ไปที่" ที่สุด
-            if to_keyword_index != -1 and name_index > to_keyword_index:
-                dist = name_index - to_keyword_index
-                if dist < min_to_dist:
-                    min_to_dist = dist
-                    closest_to_name = name
+            # เมื่อเจอผู้โอนแล้ว ให้กำหนดค่า และ "ลบ" ออกจากรายชื่อผู้สมัคร
+            if sender_candidate:
+                sender_name = sender_candidate[0]
+                all_names.remove(sender_candidate)
+        
+        # --- ขั้นตอนที่ 2: หาผู้รับจากรายชื่อที่เหลืออยู่ ---
+        if to_keyword_index != -1:
+            min_dist = float('inf')
+            recipient_candidate = None
+            # ลูปนี้จะทำงานกับ 'all_names' ที่ถูกแก้ไขแล้ว (ไม่มีชื่อผู้โอน)
+            for name, name_index in all_names:
+                if name_index > to_keyword_index:
+                    dist = name_index - to_keyword_index
+                    if dist < min_dist:
+                        min_dist = dist
+                        recipient_candidate = (name, name_index)
+            
+            if recipient_candidate:
+                recipient_name = recipient_candidate[0]
 
-        data['account'] = closest_from_name
-        data['recipient'] = closest_to_name
+        data['account'] = sender_name
+        data['recipient'] = recipient_name
     except Exception as e:
-        print(f"BBL Parser (proximity logic) failed: {e}")
+        print(f"BBL Parser (exclusive logic) failed: {e}")
         
     return data
 
