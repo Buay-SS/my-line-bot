@@ -1,4 +1,4 @@
-# === FINAL, COMPLETE, AND VERIFIED main.py (Import Fix) ===
+# === FINAL, COMPLETE, AND VERIFIED main.py (Health Check Fix) ===
 import os, json, re
 from flask import Flask, request, abort
 import requests
@@ -7,22 +7,18 @@ import gspread
 from google.oauth2.service_account import Credentials
 from collections import defaultdict
 
-# =========================================================
-#  **ส่วนที่แก้ไข: เปลี่ยน SpacerComponent เป็น FillerComponent**
-# =========================================================
 from linebot import (LineBotApi, WebhookHandler)
 from linebot.exceptions import (InvalidSignatureError, LineBotApiError)
 from linebot.models import (
     MessageEvent, ImageMessage, TextSendMessage, JoinEvent, FollowEvent, SourceUser, SourceGroup, TextMessage
 )
 from linebot.models.flex_message import (
-    FlexSendMessage, BubbleContainer, BoxComponent, TextComponent, SeparatorComponent, FillerComponent # <-- แก้ไขที่นี่
+    FlexSendMessage, BubbleContainer, BoxComponent, TextComponent, SeparatorComponent, FillerComponent
 )
-# =========================================================
 
 from slip_parser import parse_slip
 
-# (โค้ดส่วนที่เหลือทั้งหมดถูกต้องและไม่ต้องแก้ไข)
+# (โค้ดส่วนตั้งค่าและเริ่มต้น เหมือนเดิม)
 # ...
 CHANNEL_ACCESS_TOKEN = os.environ.get('CHANNEL_ACCESS_TOKEN')
 CHANNEL_SECRET = os.environ.get('CHANNEL_SECRET')
@@ -35,6 +31,8 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
+# (โค้ดส่วน Cache และฟังก์ชัน Helpers ทั้งหมดเหมือนเดิม)
+# ...
 _spreadsheet = None
 _aliases_cache = None
 _config_cache = None
@@ -75,52 +73,17 @@ def get_string(key, **kwargs):
     config = get_config()
     template = config.get(key, key)
     return template.format(**kwargs) if kwargs else template
-
 def create_summary_flex_message(summary_result):
-    if isinstance(summary_result, str):
-        return TextSendMessage(text=summary_result)
+    if isinstance(summary_result, str): return TextSendMessage(text=summary_result)
     period_text = "เดือนนี้" if summary_result['period'] == 'month' else "ปีนี้"
     total_amount = summary_result['total']
     details = summary_result['details']
     body_contents = []
     for recipient, amount in details:
-        body_contents.append(
-            BoxComponent(
-                layout='horizontal',
-                contents=[
-                    TextComponent(text=recipient, size='sm', color='#555555', flex=4),
-                    TextComponent(text=f"{amount:,.2f} บาท", size='sm', color='#111111', align='end', flex=2)
-                ]
-            )
-        )
-    bubble = BubbleContainer(
-        header=BoxComponent(
-            layout='vertical',
-            contents=[
-                TextComponent(text=f"สรุปรายจ่าย{period_text}", weight='bold', size='xl', color='#1DB446')
-            ]
-        ),
-        hero=BoxComponent(
-            layout='vertical',
-            contents=[
-                TextComponent(text="รายจ่ายทั้งหมด", size='sm', color='#AAAAAA'),
-                TextComponent(text=f"{total_amount:,.2f}", size='3xl', weight='bold', color='#111111'),
-                TextComponent(text="บาท", size='sm', color='#AAAAAA'),
-                SeparatorComponent(margin='lg')
-            ]
-        ),
-        body=BoxComponent(
-            layout='vertical',
-            spacing='md',
-            contents=[
-                TextComponent(text="รายละเอียด", weight='bold', color='#1DB446', margin='md'),
-                *body_contents
-            ]
-        )
-    )
+        body_contents.append(BoxComponent(layout='horizontal', contents=[TextComponent(text=recipient, size='sm', color='#555555', flex=4), TextComponent(text=f"{amount:,.2f} บาท", size='sm', color='#111111', align='end', flex=2)]))
+    bubble = BubbleContainer(header=BoxComponent(layout='vertical', contents=[TextComponent(text=f"สรุปรายจ่าย{period_text}", weight='bold', size='xl', color='#1DB446')]), hero=BoxComponent(layout='vertical', contents=[TextComponent(text="รายจ่ายทั้งหมด", size='sm', color='#AAAAAA'), TextComponent(text=f"{total_amount:,.2f}", size='3xl', weight='bold', color='#111111'), TextComponent(text="บาท", size='sm', color='#AAAAAA'), SeparatorComponent(margin='lg')]), body=BoxComponent(layout='vertical', spacing='md', contents=[TextComponent(text="รายละเอียด", weight='bold', color='#1DB446', margin='md'), *body_contents]))
     alt_text = f"สรุปรายจ่าย{period_text}: {total_amount:,.2f} บาท"
     return FlexSendMessage(alt_text=alt_text, contents=bubble)
-
 def generate_summary(period):
     spreadsheet = get_spreadsheet()
     if not spreadsheet: return "ไม่สามารถเชื่อมต่อกับฐานข้อมูลได้"
@@ -163,7 +126,6 @@ def generate_summary(period):
         return {'period': period, 'total': total_amount, 'details': sorted_summary}
     except Exception as e:
         return f"เกิดข้อผิดพลาดในการสร้างสรุป: {e}"
-
 def add_alias_to_sheet(original_name, nickname):
     spreadsheet = get_spreadsheet()
     if not spreadsheet: return False, "DB connection error"
@@ -215,15 +177,31 @@ def log_transaction_to_sheet(log_data):
         worksheet.append_row(new_row, value_input_option='USER_ENTERED')
         return True, get_string('MSG_LOG_SUCCESS')
     except Exception as e: return False, get_string('MSG_LOG_ERROR')
+
+# =========================================================
+#  **เพิ่ม Route ใหม่สำหรับ Health Check**
+# =========================================================
+@app.route("/health", methods=['GET'])
+def health_check():
+    return "OK", 200
+
+# Route เดิมสำหรับ UptimeRobot (ยังคงไว้)
 @app.route("/", methods=['GET', 'HEAD'])
-def home(): return "OK", 200
+def home():
+    return "OK", 200
+
+# Webhook หลักสำหรับ LINE
 @app.route("/callback", methods=['POST'])
 def callback():
+    # ... (โค้ดส่วนนี้เหมือนเดิม)
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
     try: handler.handle(body, signature)
     except InvalidSignatureError: abort(400)
     return 'OK'
+
+# (Event Handlers ทั้งหมดที่เหลือ เหมือนเดิม)
+# ...
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     text = event.message.text.lower().strip()
@@ -266,7 +244,6 @@ def handle_text_message(event):
             return
     if text in ["ping", "wake up", "ตื่น", "หวัดดี", "สวัสดี"]:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=get_string('MSG_WAKE_UP')))
-
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
     source = event.source
