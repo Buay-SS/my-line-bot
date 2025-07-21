@@ -8,11 +8,15 @@ from collections import defaultdict
 
 from linebot import (LineBotApi, WebhookHandler)
 from linebot.exceptions import (InvalidSignatureError, LineBotApiError)
-from linebot.models import (MessageEvent, ImageMessage, TextSendMessage, JoinEvent, FollowEvent, SourceUser, SourceGroup, TextMessage)
+from linebot.models import (
+    MessageEvent, ImageMessage, TextSendMessage, JoinEvent, FollowEvent, SourceUser, SourceGroup, TextMessage,
+    # --- ส่วนประกอบของ Flex Message ที่ต้องนำเข้า ---
+    FlexSendMessage, BubbleContainer, BoxComponent, TextComponent, SeparatorComponent, SpacerComponent
+)
 
 from slip_parser import parse_slip
 
-# --- ส่วนตั้งค่าและเริ่มต้น (เหมือนเดิม) ---
+# (โค้ดส่วนตั้งค่าและเริ่มต้น เหมือนเดิม)
 # ...
 CHANNEL_ACCESS_TOKEN = os.environ.get('CHANNEL_ACCESS_TOKEN')
 CHANNEL_SECRET = os.environ.get('CHANNEL_SECRET')
@@ -25,7 +29,7 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# --- ระบบ Cache (เหมือนเดิม) ---
+# (โค้ดส่วน Cache และ get_spreadsheet, get_aliases, get_config, get_string ทั้งหมดเหมือนเดิม)
 # ...
 _spreadsheet = None
 _aliases_cache = None
@@ -41,7 +45,6 @@ def get_spreadsheet():
         _spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
         return _spreadsheet
     except: return None
-
 def get_aliases():
     global _aliases_cache
     if _aliases_cache is not None: return _aliases_cache
@@ -53,7 +56,6 @@ def get_aliases():
         _aliases_cache = {record['OriginalName']: record['Nickname'] for record in records if record.get('OriginalName')}
         return _aliases_cache
     except: _aliases_cache = {}; return _aliases_cache
-
 def get_config():
     global _config_cache
     if _config_cache is not None: return _config_cache
@@ -71,89 +73,168 @@ def get_string(key, **kwargs):
     return template.format(**kwargs) if kwargs else template
 
 # =========================================================
-#  **อัปเกรดฟังก์ชันสรุปยอด ให้รองรับวันที่หลายรูปแบบ**
+#  **ฟังก์ชันใหม่: สร้าง Flex Message สรุปยอด**
 # =========================================================
+def create_summary_flex_message(summary_result):
+    if isinstance(summary_result, str): # กรณีเกิด Error หรือไม่พบข้อมูล
+        return TextSendMessage(text=summary_result)
+
+    period_text = "เดือนนี้" if summary_result['period'] == 'month' else "ปีนี้"
+    total_amount = summary_result['total']
+    details = summary_result['details']
+
+    # สร้าง Body Components (รายการรายละเอียด)
+    body_contents = []
+    for recipient, amount in details:
+        body_contents.append(
+            BoxComponent(
+                layout='horizontal',
+                contents=[
+                    TextComponent(text=recipient, size='sm', color='#555555', flex=4),
+                    TextComponent(text=f"{amount:,.2f} บาท", size='sm', color='#111111', align='end', flex=2)
+                ]
+            )
+        )
+    
+    bubble = BubbleContainer(
+        header=BoxComponent(
+            layout='vertical',
+            contents=[
+                TextComponent(text=f"สรุปรายจ่าย{period_text}", weight='bold', size='xl', color='#1DB446')
+            ]
+        ),
+        hero=BoxComponent(
+            layout='vertical',
+            contents=[
+                TextComponent(text="รายจ่ายทั้งหมด", size='sm', color='#AAAAAA'),
+                TextComponent(text=f"{total_amount:,.2f}", size='3xl', weight='bold', color='#111111'),
+                TextComponent(text="บาท", size='sm', color='#AAAAAA'),
+                SeparatorComponent(margin='lg')
+            ]
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            spacing='md',
+            contents=[
+                TextComponent(text="รายละเอียด", weight='bold', color='#1DB446', margin='md'),
+                *body_contents # Unpack list ของ detail items
+            ]
+        )
+    )
+    
+    alt_text = f"สรุปรายจ่าย{period_text}: {total_amount:,.2f} บาท"
+    return FlexSendMessage(alt_text=alt_text, contents=bubble)
+
+# --- ฟังก์ชันสรุปยอด (อัปเกรด: คืนค่าเป็น Dictionary) ---
 def generate_summary(period):
     spreadsheet = get_spreadsheet()
-    if not spreadsheet:
-        return "ไม่สามารถเชื่อมต่อกับฐานข้อมูลได้"
-
+    if not spreadsheet: return "ไม่สามารถเชื่อมต่อกับฐานข้อมูลได้"
     try:
+        # ... (โค้ดส่วนดึงและกรองข้อมูลเหมือนเดิม)
         transactions_sheet = spreadsheet.worksheet("Transactions")
         all_records = transactions_sheet.get_all_records()
         aliases = get_aliases()
         known_nicknames = set(aliases.values())
-        
-        thai_tz = timezone(timedelta(hours=7))
-        now = datetime.now(thai_tz)
-        
+        now = datetime.now(timezone(timedelta(hours=7)))
         filtered_records = []
-        # --- จุดที่แก้ไข ---
-        # สร้างลิสต์ของรูปแบบวันที่ที่เรายอมรับ
         accepted_date_formats = ['%Y-%m-%d', '%m-%d-%Y', '%d-%m-%Y']
-
         for record in all_records:
             record_date = None
             date_str = record.get('TransactionDate')
             if not date_str: continue
-
-            # พยายามแปลงวันที่ทีละรูปแบบจนกว่าจะสำเร็จ
             for fmt in accepted_date_formats:
                 try:
                     record_date = datetime.strptime(date_str, fmt)
-                    break # ถ้าสำเร็จ ให้ออกจากลูป
-                except (ValueError, TypeError):
-                    continue # ถ้าล้มเหลว ให้ลองรูปแบบถัดไป
-            
-            # ถ้าลองทุกรูปแบบแล้วยังแปลงไม่ได้ ก็ข้ามรายการนี้ไป
-            if not record_date:
-                continue
-
-            # กรองข้อมูลตามช่วงเวลา
+                    break
+                except (ValueError, TypeError): continue
+            if not record_date: continue
             if period == 'month' and record_date.year == now.year and record_date.month == now.month:
                 filtered_records.append(record)
             elif period == 'year' and record_date.year == now.year:
                 filtered_records.append(record)
         
-        # --- ส่วนที่เหลือเหมือนเดิม ---
         if not filtered_records:
             return f"ไม่พบข้อมูลรายจ่ายสำหรับ{'เดือนนี้' if period == 'month' else 'ปีนี้'}"
 
+        # ... (โค้ดส่วนรวมยอดเหมือนเดิม)
         summary_data = defaultdict(float)
         total_amount = 0.0
-
         for record in filtered_records:
             try:
-                # แปลง Amount ที่อาจมีคอมม่า
                 amount_str = str(record.get('Amount', '0')).replace(',', '')
                 amount = float(amount_str)
                 recipient = record['ToRecipient']
-                
                 total_amount += amount
-                
-                if recipient in known_nicknames:
-                    summary_data[recipient] += amount
-                else:
-                    summary_data['อื่นๆ'] += amount
-            except (ValueError, TypeError):
-                continue
+                if recipient in known_nicknames: summary_data[recipient] += amount
+                else: summary_data['อื่นๆ'] += amount
+            except (ValueError, TypeError): continue
 
-        header = f"สรุปรายจ่าย{'เดือนนี้' if period == 'month' else 'ปีนี้'}"
-        reply_lines = [
-            header,
-            f"รายจ่ายทั้งหมด   {total_amount:,.2f} บาท",
-            "รายละเอียด"
-        ]
-        
         sorted_summary = sorted(summary_data.items(), key=lambda item: item[1], reverse=True)
-        for recipient, amount in sorted_summary:
-            reply_lines.append(f"{recipient}  {amount:,.2f} บาท")
-            
-        return "\n".join(reply_lines)
+        
+        # คืนค่าเป็น Dictionary แทนที่จะเป็น String
+        return {
+            'period': period,
+            'total': total_amount,
+            'details': sorted_summary
+        }
 
     except Exception as e:
-        print(f"--- ERROR generating summary: {e} ---")
         return f"เกิดข้อผิดพลาดในการสร้างสรุป: {e}"
+
+# --- Event Handler: ข้อความ (อัปเกรด!) ---
+@handler.add(MessageEvent, message=TextMessage)
+def handle_text_message(event):
+    text = event.message.text.lower().strip()
+    source = event.source
+    user_id = source.user_id
+    
+    # --- ตรรกะการอนุมัติแบบใหม่ ---
+    source_id_for_approval = source.group_id if isinstance(source, SourceGroup) else user_id
+
+    # คำสั่งสำหรับผู้ใช้ที่ Approved แล้ว
+    if is_approved(source_id_for_approval):
+        if text == "สรุปเดือนนี้":
+            summary_result = generate_summary('month')
+            reply_message = create_summary_flex_message(summary_result)
+            line_bot_api.reply_message(event.reply_token, reply_message)
+            return
+        elif text == "สรุปปีนี้":
+            summary_result = generate_summary('year')
+            reply_message = create_summary_flex_message(summary_result)
+            line_bot_api.reply_message(event.reply_token, reply_message)
+            return
+
+    # คำสั่งสำหรับแอดมินเท่านั้น
+    if user_id == ADMIN_USER_ID:
+        original_text = event.message.text
+        if original_text.lower().startswith("alias:"):
+            # ... (โค้ดส่วนนี้เหมือนเดิม)
+            try:
+                command_body = original_text[len("alias:"):].strip()
+                original_name, nickname = [part.strip() for part in command_body.split('=', 1)]
+                success, message = add_alias_to_sheet(original_name, nickname)
+                reply_text = message
+            except ValueError: reply_text = get_string('MSG_ALIAS_CMD_ERROR')
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            return
+        elif text == "reload aliases":
+            # ... (โค้ดส่วนนี้เหมือนเดิม)
+            global _aliases_cache
+            _aliases_cache = None; aliases = get_aliases()
+            reply_text = get_string('MSG_ALIAS_RELOAD_SUCCESS', count=len(aliases))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            return
+        elif text == "reload config":
+            # ... (โค้ดส่วนนี้เหมือนเดิม)
+            global _config_cache
+            _config_cache = None; config = get_config()
+            reply_text = f"โหลดข้อความใหม่ {len(config)} รายการสำเร็จ!"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            return
+
+    # คำสั่งปลุกบอท (สำหรับทุกคน)
+    if text in ["ping", "wake up", "ตื่น", "หวัดดี", "สวัสดี"]:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=get_string('MSG_WAKE_UP')))
 
 # (โค้ดส่วนที่เหลือทั้งหมดเหมือนเดิม ไม่ต้องแก้ไข)
 # ...
@@ -173,7 +254,6 @@ def add_alias_to_sheet(original_name, nickname):
         _aliases_cache = None
         return True, message
     except Exception as e: return False, f"เกิดข้อผิดพลาด: {e}"
-
 def is_approved(source_id):
     spreadsheet = get_spreadsheet()
     if not spreadsheet: return False
@@ -182,7 +262,6 @@ def is_approved(source_id):
         cell = worksheet.find(source_id)
         return cell and worksheet.cell(cell.row, 4).value.lower() == 'approved'
     except: return False
-
 def register_source(source_id, display_name, source_type):
     spreadsheet = get_spreadsheet()
     if not spreadsheet: return
@@ -193,7 +272,6 @@ def register_source(source_id, display_name, source_type):
             if ADMIN_USER_ID:
                 line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=f"New {source_type} needs approval:\nName: {display_name}"))
     except Exception as e: print(f"Error registering source: {e}")
-
 def log_transaction_to_sheet(log_data):
     spreadsheet = get_spreadsheet()
     if not spreadsheet: return False, "DB connection error"
@@ -211,10 +289,8 @@ def log_transaction_to_sheet(log_data):
         worksheet.append_row(new_row, value_input_option='USER_ENTERED')
         return True, get_string('MSG_LOG_SUCCESS')
     except Exception as e: return False, get_string('MSG_LOG_ERROR')
-
 @app.route("/", methods=['GET', 'HEAD'])
 def home(): return "OK", 200
-
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
@@ -222,46 +298,6 @@ def callback():
     try: handler.handle(body, signature)
     except InvalidSignatureError: abort(400)
     return 'OK'
-
-@handler.add(MessageEvent, message=TextMessage)
-def handle_text_message(event):
-    text = event.message.text.lower().strip()
-    user_id = event.source.user_id
-    if user_id == ADMIN_USER_ID:
-        if text == "สรุปเดือนนี้":
-            reply_text = generate_summary('month')
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-        elif text == "สรุปปีนี้":
-            reply_text = generate_summary('year')
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-        original_text = event.message.text
-        if original_text.lower().startswith("alias:"):
-            try:
-                command_body = original_text[len("alias:"):].strip()
-                original_name, nickname = [part.strip() for part in command_body.split('=', 1)]
-                success, message = add_alias_to_sheet(original_name, nickname)
-                reply_text = message
-            except ValueError:
-                reply_text = get_string('MSG_ALIAS_CMD_ERROR')
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-        elif text == "reload aliases":
-            global _aliases_cache
-            _aliases_cache = None; aliases = get_aliases()
-            reply_text = get_string('MSG_ALIAS_RELOAD_SUCCESS', count=len(aliases))
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-        elif text == "reload config":
-            global _config_cache
-            _config_cache = None; config = get_config()
-            reply_text = f"โหลดข้อความใหม่ {len(config)} รายการสำเร็จ!"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-    if text in ["ping", "wake up", "ตื่น", "หวัดดี", "สวัสดี"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=get_string('MSG_WAKE_UP')))
-
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
     source = event.source
@@ -309,7 +345,6 @@ def handle_image_message(event):
         final_reply_text = get_string('MSG_OCR_ERROR')
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=final_reply_text))
 
-
 @handler.add(JoinEvent)
 def handle_join(event):
     if isinstance(event.source, SourceGroup):
@@ -317,8 +352,6 @@ def handle_join(event):
         except: group_name = "Unknown Group"
         register_source(event.source.group_id, group_name, 'group')
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"สวัสดีครับ! บอทได้รับการเพิ่มเข้ากลุ่ม '{group_name}' แล้ว และกำลังรอการอนุมัติเพื่อเริ่มใช้งานครับ"))
-
-
 @handler.add(FollowEvent)
 def handle_follow(event):
     if isinstance(event.source, SourceUser):
@@ -326,8 +359,6 @@ def handle_follow(event):
         except: display_name = "Unknown User"
         register_source(event.source.user_id, display_name, 'user')
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="ขอบคุณที่เพิ่มเป็นเพื่อนครับ! กำลังรอการอนุมัติเพื่อเริ่มใช้งาน"))
-
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
