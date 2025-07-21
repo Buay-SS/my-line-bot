@@ -1,35 +1,34 @@
-import os
-import json
-import re
+# (โค้ดส่วน Imports และส่วนตั้งค่า เหมือนเดิมทั้งหมด)
+# ...
+import os, json, re
 from flask import Flask, request, abort
 import requests
 from datetime import datetime, timezone, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
-
 from linebot import (LineBotApi, WebhookHandler)
 from linebot.exceptions import (InvalidSignatureError, LineBotApiError)
 from linebot.models import (MessageEvent, ImageMessage, TextSendMessage, JoinEvent, FollowEvent, SourceUser, SourceGroup, TextMessage)
-
 from slip_parser import parse_slip
 
-# (โค้ดส่วนตั้งค่า และส่วนเริ่มต้นโปรแกรม เหมือนเดิมทั้งหมด)
 CHANNEL_ACCESS_TOKEN = os.environ.get('CHANNEL_ACCESS_TOKEN')
 CHANNEL_SECRET = os.environ.get('CHANNEL_SECRET')
+#... (ตัวแปรอื่นๆ)
 OCR_SPACE_API_KEY = os.environ.get('OCR_SPACE_API_KEY')
 ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID')
 GOOGLE_CREDENTIALS_JSON_STRING = os.environ.get('GOOGLE_CREDENTIALS_JSON')
 GOOGLE_SHEET_ID = os.environ.get('GOOGLE_SHEET_ID')
 
+
 app = Flask(__name__)
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# (โค้ดส่วนเชื่อมต่อ Google Sheet และจัดการ Alias เหมือนเดิมทั้งหมด)
 _spreadsheet = None
 _aliases_cache = None
 
 def get_spreadsheet():
+    # ... (โค้ดส่วนนี้เหมือนเดิม)
     global _spreadsheet
     if _spreadsheet: return _spreadsheet
     try:
@@ -38,10 +37,10 @@ def get_spreadsheet():
         gc = gspread.authorize(credentials)
         _spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
         return _spreadsheet
-    except Exception as e:
-        return None
+    except Exception as e: return None
 
 def get_aliases():
+    # ... (โค้ดส่วนนี้เหมือนเดิม)
     global _aliases_cache
     if _aliases_cache is not None: return _aliases_cache
     spreadsheet = get_spreadsheet()
@@ -58,7 +57,7 @@ def get_aliases():
         return _aliases_cache
 
 # =========================================================
-#  **อัปเกรดฟังก์ชันบันทึกรายการ ให้รับชื่อกลุ่มด้วย**
+#  **อัปเกรดฟังก์ชันบันทึกรายการ ให้ป้องกันการบันทึกซ้ำ**
 # =========================================================
 def log_transaction_to_sheet(log_data):
     spreadsheet = get_spreadsheet()
@@ -66,19 +65,32 @@ def log_transaction_to_sheet(log_data):
         return False, "ไม่สามารถเชื่อมต่อกับฐานข้อมูล (Sheet) ได้"
     try:
         worksheet = spreadsheet.worksheet("Transactions")
+        
+        ref_id = log_data.get('ref_id')
+        # ตรวจสอบว่ามี ref_id หรือไม่
+        if not ref_id or ref_id == 'N/A':
+            return False, "ไม่พบรหัสอ้างอิงในสลิป ไม่สามารถบันทึกได้"
+
+        # ค้นหา ref_id ในคอลัมน์ที่ 6 (F)
+        cell = worksheet.find(ref_id, in_column=6)
+        if cell:
+            # ถ้าเจอ แสดงว่ามีข้อมูลนี้อยู่แล้ว
+            return False, f"รายการนี้เคยถูกบันทึกแล้วในแถวที่ {cell.row}"
+
+        # ถ้าไม่เจอ ก็ทำการบันทึก
         thai_tz = timezone(timedelta(hours=7))
         timestamp = datetime.now(thai_tz).strftime("%Y-%m-%d %H:%M:%S")
         
-        # เพิ่ม source_group เข้าไปในแถวใหม่
         new_row = [
             timestamp,
             log_data.get('date', 'N/A'),
             log_data.get('from', 'N/A'),
             log_data.get('to', 'N/A'),
             log_data.get('amount', 0.0),
+            ref_id, # <-- บันทึก ref_id ลงไป
             log_data.get('recorded_by_id', 'N/A'),
             log_data.get('recorded_by_name', 'N/A'),
-            log_data.get('source_group', 'N/A (Direct Message)') # <-- คอลัมน์ใหม่
+            log_data.get('source_group', 'N/A (Direct Message)')
         ]
         worksheet.append_row(new_row, value_input_option='USER_ENTERED')
         return True, "บันทึกรายการเรียบร้อย!"
@@ -86,58 +98,44 @@ def log_transaction_to_sheet(log_data):
         print(f"--- ERROR logging transaction: {e} ---")
         return False, "เกิดข้อผิดพลาดในการบันทึกข้อมูล"
 
-
 # =========================================================
-#  **ยกเครื่อง handle_image_message ให้ทำงานกับกลุ่มได้สมบูรณ์แบบ**
+#  **อัปเกรด handle_image_message ให้ส่ง ref_id ไปด้วย**
 # =========================================================
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
+    #... (ส่วนดึงข้อมูลผู้ส่งและเช็คสิทธิ์ เหมือนเดิม)
     source = event.source
     user_id = source.user_id
-    
-    # --- ส่วนดึงข้อมูลผู้ส่งและกลุ่ม (ใหม่!) ---
     recorder_name = "N/A"
     group_name = "N/A (Direct Message)"
-    source_for_approval = user_id # โดยเริ่มต้น ให้ใช้ user_id ในการเช็คสิทธิ์
-
+    source_for_approval = user_id
     if isinstance(source, SourceGroup):
         group_id = source.group_id
-        source_for_approval = group_id # ถ้ามาจากกลุ่ม ให้ใช้ group_id ในการเช็คสิทธิ์
+        source_for_approval = group_id
         try:
-            # ดึงชื่อกลุ่ม
             group_summary = line_bot_api.get_group_summary(group_id)
             group_name = group_summary.group_name
-            # ดึงชื่อสมาชิกในกลุ่ม
             member_profile = line_bot_api.get_group_member_profile(group_id, user_id)
             recorder_name = member_profile.display_name
-        except LineBotApiError as e:
-            print(f"Error getting group/member info: {e}")
-            recorder_name = "N/A (API Error)"
-            group_name = "N/A (API Error)"
-            
+        except LineBotApiError as e: recorder_name = "N/A (API Error)"
     elif isinstance(source, SourceUser):
         try:
             profile = line_bot_api.get_profile(user_id)
             recorder_name = profile.display_name
-        except LineBotApiError as e:
-            print(f"Cannot get profile for {user_id}: {e}")
-            recorder_name = "N/A (API Error)"
+        except LineBotApiError as e: recorder_name = "N/A (API Error)"
 
-    # --- ส่วนเช็คสิทธิ์ (ใช้ source_for_approval) ---
     if not is_approved(source_for_approval):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="บอทกำลังรอการอนุมัติจากผู้ดูแลระบบครับ"))
         return
 
-    # --- ส่วนประมวลผลรูปภาพ (เหมือนเดิม) ---
+    #... (ส่วนประมวลผล OCR เหมือนเดิม)
     message_content = line_bot_api.get_message_content(event.message.id)
-    # ... (โค้ดส่วน requests.post ไปยัง ocr.space เหมือนเดิม) ...
     url_api = "https://api.ocr.space/parse/image"
     response = requests.post(url_api, 
         files={"image": ("receipt.jpg", message_content.content, "image/jpeg")},
         data={"apikey": OCR_SPACE_API_KEY, "language": "tha", "OCREngine": "2"}
     )
     result = response.json()
-
 
     if result.get("IsErroredOnProcessing") == False and result.get("ParsedResults"):
         detected_text = result["ParsedResults"][0]["ParsedText"]
@@ -148,37 +146,36 @@ def handle_image_message(event):
         display_recipient = aliases.get(parsed_data.get('recipient'), parsed_data.get('recipient'))
         
         summary_text = (
-            f"สรุปรายการ (บันทึกโดย: {recorder_name}):\n" # <-- เพิ่มชื่อคนบันทึก
+            f"สรุปรายการ (บันทึกโดย: {recorder_name}):\n"
             f"-------------------\n"
             f"วันที่: {parsed_data.get('date', 'N/A')}\n"
             f"จาก: {display_account}\n"
             f"ถึง: {display_recipient}\n"
-            f"จำนวน: {parsed_data.get('amount', 'N/A')} บาท"
+            f"จำนวน: {parsed_data.get('amount', 'N/A')} บาท\n"
+            f"Ref: {parsed_data.get('ref_id', 'N/A')}" # <-- แสดง Ref ID ให้ผู้ใช้เห็นด้วย
         )
 
-        # --- ส่วนของการบันทึกข้อมูล (อัปเกรด!) ---
         log_data = {
             'date': parsed_data.get('date', 'N/A'),
             'from': display_account,
             'to': display_recipient,
             'amount': parsed_data.get('amount', 0.0),
+            'ref_id': parsed_data.get('ref_id', 'N/A'), # <-- ส่ง ref_id ไปด้วย
             'recorded_by_id': user_id,
             'recorded_by_name': recorder_name,
-            'source_group': group_name # <-- ส่งชื่อกลุ่มไปด้วย
+            'source_group': group_name
         }
         log_success, log_message = log_transaction_to_sheet(log_data)
         
         final_reply_text = f"{summary_text}\n-------------------\nสถานะ: {log_message}"
-
     else:
         final_reply_text = "ขออภัยครับ ไม่สามารถอ่านข้อความจากรูปภาพได้"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=final_reply_text))
 
-
-# (โค้ดส่วนอื่นๆ ที่เหลือทั้งหมดเหมือนเดิม ไม่ต้องแก้ไข)
+# (โค้ดส่วนที่เหลือทั้งหมดเหมือนเดิม ไม่ต้องแก้ไข)
+# ...
 def add_alias_to_sheet(original_name, nickname):
-    #...
     spreadsheet = get_spreadsheet()
     if not spreadsheet: return False, "ไม่สามารถเชื่อมต่อกับฐานข้อมูลได้"
     try:
@@ -196,19 +193,7 @@ def add_alias_to_sheet(original_name, nickname):
     except Exception as e:
         return False, f"เกิดข้อผิดพลาด: {e}"
 
-def is_approved(source_id):
-    #...
-    spreadsheet = get_spreadsheet()
-    if not spreadsheet: return False
-    try:
-        worksheet = spreadsheet.worksheet("Sheet1")
-        cell = worksheet.find(source_id)
-        return cell and worksheet.cell(cell.row, 4).value.lower() == 'approved'
-    except Exception as e: 
-        return False
-
 def register_source(source_id, display_name, source_type):
-    #...
     spreadsheet = get_spreadsheet()
     if not spreadsheet: return
     try:
@@ -234,7 +219,6 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
-    #...
     text = event.message.text
     user_id = event.source.user_id
     if user_id == ADMIN_USER_ID:
