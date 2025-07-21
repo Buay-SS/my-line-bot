@@ -1,296 +1,128 @@
-# === FINAL, COMPLETE, AND VERIFIED main.py (All Features Included) ===
-import os, json, re
-from flask import Flask, request, abort
-import requests
-from datetime import datetime, timezone, timedelta
-import gspread
-from google.oauth2.service_account import Credentials
-from collections import defaultdict
+import re
+from datetime import datetime
 
-from linebot import (LineBotApi, WebhookHandler)
-from linebot.exceptions import (InvalidSignatureError, LineBotApiError)
-from linebot.models import (MessageEvent, ImageMessage, TextSendMessage, JoinEvent, FollowEvent, SourceUser, SourceGroup, TextMessage)
+# --- พจนานุกรมและฟังก์ชันช่วยเหลือ ---
+THAI_MONTH_MAP = {
+    'ม.ค.': 1, 'ก.พ.': 2, 'มี.ค.': 3, 'เม.ย.': 4, 'พ.ค.': 5, 'มิ.ย.': 6,
+    'ก.ค.': 7, 'ส.ค.': 8, 'ก.ย.': 9, 'ต.ค.': 10, 'พ.ย.': 11, 'ธ.ค.': 12
+}
 
-from slip_parser import parse_slip
-
-# --- ส่วนตั้งค่า ---
-CHANNEL_ACCESS_TOKEN = os.environ.get('CHANNEL_ACCESS_TOKEN')
-CHANNEL_SECRET = os.environ.get('CHANNEL_SECRET')
-OCR_SPACE_API_KEY = os.environ.get('OCR_SPACE_API_KEY')
-ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID')
-GOOGLE_CREDENTIALS_JSON_STRING = os.environ.get('GOOGLE_CREDENTIALS_JSON')
-GOOGLE_SHEET_ID = os.environ.get('GOOGLE_SHEET_ID')
-
-# --- ส่วนเริ่มต้นโปรแกรม ---
-app = Flask(__name__)
-line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
-
-# --- ระบบ Cache ---
-_spreadsheet = None
-_aliases_cache = None
-_config_cache = None
-
-# --- ฟังก์ชัน Helpers ---
-def get_spreadsheet():
-    global _spreadsheet
-    if _spreadsheet: return _spreadsheet
+def normalize_date(day_str, month_str, year_str):
     try:
-        scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file']
-        credentials = Credentials.from_service_account_info(json.loads(GOOGLE_CREDENTIALS_JSON_STRING), scopes=scopes)
-        gc = gspread.authorize(credentials)
-        _spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
-        return _spreadsheet
+        day = int(day_str)
+        month = THAI_MONTH_MAP.get(month_str.strip())
+        year = int(year_str)
+        if year < 100: year += 2500
+        if year > 2500: year -= 543
+        return f"{year:04d}-{month:02d}-{day:02d}"
     except: return None
-def get_aliases():
-    global _aliases_cache
-    if _aliases_cache is not None: return _aliases_cache
-    spreadsheet = get_spreadsheet()
-    if not spreadsheet: _aliases_cache = {}; return _aliases_cache
-    try:
-        alias_sheet = spreadsheet.worksheet("Aliases")
-        records = alias_sheet.get_all_records()
-        _aliases_cache = {record['OriginalName']: record['Nickname'] for record in records if record.get('OriginalName')}
-        return _aliases_cache
-    except: _aliases_cache = {}; return _aliases_cache
-def get_config():
-    global _config_cache
-    if _config_cache is not None: return _config_cache
-    spreadsheet = get_spreadsheet()
-    if not spreadsheet: _config_cache = {}; return _config_cache
-    try:
-        config_sheet = spreadsheet.worksheet("Config")
-        records = config_sheet.get_all_records()
-        _config_cache = {record['Key']: record['Value'] for record in records if record.get('Key')}
-        return _config_cache
-    except: _config_cache = {}; return _config_cache
-def get_string(key, **kwargs):
-    config = get_config()
-    template = config.get(key, key)
-    return template.format(**kwargs) if kwargs else template
-def add_alias_to_sheet(original_name, nickname):
-    spreadsheet = get_spreadsheet()
-    if not spreadsheet: return False, "DB connection error"
-    try:
-        alias_sheet = spreadsheet.worksheet("Aliases")
-        cell = alias_sheet.find(original_name, in_column=1)
-        if cell:
-            alias_sheet.update_cell(cell.row, 2, nickname)
-            message = get_string('MSG_ALIAS_UPDATED')
-        else:
-            alias_sheet.append_row([original_name, nickname])
-            message = get_string('MSG_ALIAS_ADDED')
-        global _aliases_cache
-        _aliases_cache = None
-        return True, message
-    except Exception as e: return False, f"เกิดข้อผิดพลาด: {e}"
-def is_approved(source_id):
-    spreadsheet = get_spreadsheet()
-    if not spreadsheet: return False
-    try:
-        worksheet = spreadsheet.worksheet("Sheet1")
-        cell = worksheet.find(source_id)
-        return cell and worksheet.cell(cell.row, 4).value.lower() == 'approved'
-    except: return False
-def register_source(source_id, display_name, source_type):
-    spreadsheet = get_spreadsheet()
-    if not spreadsheet: return
-    try:
-        worksheet = spreadsheet.worksheet("Sheet1")
-        if not worksheet.find(source_id):
-            worksheet.append_row([source_id, display_name, source_type, 'pending', datetime.now().isoformat()])
-            if ADMIN_USER_ID:
-                line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=f"New {source_type} needs approval:\nName: {display_name}"))
-    except Exception as e: print(f"Error registering source: {e}")
-def log_transaction_to_sheet(log_data):
-    spreadsheet = get_spreadsheet()
-    if not spreadsheet: return False, "DB connection error"
-    try:
-        worksheet = spreadsheet.worksheet("Transactions")
-        ref_id = log_data.get('ref_id')
-        if not ref_id or ref_id == 'N/A':
-            return False, get_string('MSG_LOG_NO_REF')
-        cell = worksheet.find(ref_id, in_column=6)
-        if cell:
-            return False, get_string('MSG_LOG_DUPLICATE', row=cell.row)
-        thai_tz = timezone(timedelta(hours=7))
-        timestamp = datetime.now(thai_tz).strftime("%Y-%m-%d %H:%M:%S")
-        new_row = [ timestamp, log_data.get('date', 'N/A'), log_data.get('from', 'N/A'), log_data.get('to', 'N/A'), log_data.get('amount', 0.0), ref_id, log_data.get('source_id', 'N/A'), log_data.get('sender_name', 'N/A'), log_data.get('sender_id', 'N/A'), log_data.get('source_group_name', 'N/A') ]
-        worksheet.append_row(new_row, value_input_option='USER_ENTERED')
-        return True, get_string('MSG_LOG_SUCCESS')
-    except Exception as e: return False, get_string('MSG_LOG_ERROR')
-def generate_summary(period, source_id):
-    spreadsheet = get_spreadsheet()
-    if not spreadsheet: return "ไม่สามารถเชื่อมต่อกับฐานข้อมูลได้"
-    try:
-        transactions_sheet = spreadsheet.worksheet("Transactions")
-        all_records = transactions_sheet.get_all_records()
-        my_records = [rec for rec in all_records if rec.get('SourceId') == source_id]
-        if not my_records:
-            return f"ไม่พบข้อมูลรายจ่ายสำหรับ{'คุณ' if source_id.startswith('U') else 'กลุ่มนี้'} ใน{'เดือนนี้' if period == 'month' else 'ปีนี้'}"
-        aliases = get_aliases()
-        known_nicknames = set(aliases.values())
-        now = datetime.now(timezone(timedelta(hours=7)))
-        filtered_records = []
-        accepted_date_formats = ['%Y-%m-%d', '%m-%d-%Y', '%d-%m-%Y']
-        for record in my_records:
-            record_date = None
-            date_str = record.get('TransactionDate')
-            if not date_str: continue
-            for fmt in accepted_date_formats:
-                try:
-                    record_date = datetime.strptime(date_str, fmt)
-                    break
-                except (ValueError, TypeError): continue
-            if not record_date: continue
-            if period == 'month' and record_date.year == now.year and record_date.month == now.month:
-                filtered_records.append(record)
-            elif period == 'year' and record_date.year == now.year:
-                filtered_records.append(record)
-        if not filtered_records:
-            return f"ไม่พบข้อมูลรายจ่ายสำหรับ{'คุณ' if source_id.startswith('U') else 'กลุ่มนี้'} ใน{'เดือนนี้' if period == 'month' else 'ปีนี้'}"
-        summary_data = defaultdict(float)
-        total_amount = 0.0
-        for record in filtered_records:
-            try:
-                amount_str = str(record.get('Amount', '0')).replace(',', '')
-                amount = float(amount_str)
-                recipient = record['ToRecipient']
-                total_amount += amount
-                if recipient in known_nicknames: summary_data[recipient] += amount
-                else: summary_data['อื่นๆ'] += amount
-            except (ValueError, TypeError): continue
-        header = f"สรุปรายจ่าย{'เดือนนี้' if period == 'month' else 'ปีนี้'} ({'ส่วนตัว' if source_id.startswith('U') else 'ของกลุ่ม'})"
-        reply_lines = [header, f"รายจ่ายทั้งหมด   {total_amount:,.2f} บาท", "รายละเอียด"]
-        sorted_summary = sorted(summary_data.items(), key=lambda item: item[1], reverse=True)
-        for recipient, amount in sorted_summary:
-            reply_lines.append(f"{recipient}  {amount:,.2f} บาท")
-        return "\n".join(reply_lines)
-    except Exception as e:
-        return f"เกิดข้อผิดพลาดในการสร้างสรุป: {e}"
 
-# --- Web Server Routes ---
-@app.route("/health", methods=['GET'])
-def health_check():
-    return "OK", 200
+def find_amount(text):
+    patterns = [
+        r'(?:จำนวน|Amount)[\s:]*([,\d]+\.\d{2})',
+        r'([,\d]+\.\d{2})\s*THB'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match: return float(match.group(1).replace(',', ''))
+    all_amounts = [float(amount.replace(',', '')) for amount in re.findall(r'(\d{1,3}(?:,\d{3})*\.\d{2})', text)]
+    return max(all_amounts) if all_amounts else None
 
-@app.route("/", methods=['GET', 'HEAD'])
-def home():
-    return "OK", 200
+def find_reference_id(text):
+    patterns = [
+        r'เลขที่รายการ[:\s]*([a-zA-Z0-9]{15,})',
+        r'รหัสอ้างอิง[:\s]*([a-zA-Z0-9]{15,})',
+        r'เลขที่อ้างอิง[:\s]*([a-zA-Z0-9]{15,})',
+        r'\b([a-zA-Z0-9]{20,})\b'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
 
-@app.route("/callback", methods=['POST'])
-def callback():
-    signature = request.headers['X-Line-Signature']
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-    return 'OK'
-
-# --- LINE Event Handlers ---
-@handler.add(MessageEvent, message=ImageMessage)
-def handle_image_message(event):
-    source = event.source
-    sender_id = source.user_id
-    sender_name, group_name = "N/A", "N/A (Direct Message)"
-    source_id_for_approval_and_log = sender_id
-    if isinstance(source, SourceGroup):
-        group_id = source.group_id
-        source_id_for_approval_and_log = group_id
-        try:
-            group_summary = line_bot_api.get_group_summary(group_id)
-            group_name = group_summary.group_name
-            member_profile = line_bot_api.get_group_member_profile(group_id, sender_id)
-            sender_name = member_profile.display_name
-        except LineBotApiError: sender_name = "N/A (API Error)"
-    elif isinstance(source, SourceUser):
-        try:
-            profile = line_bot_api.get_profile(sender_id)
-            sender_name = profile.display_name
-        except LineBotApiError: sender_name = "N/A (API Error)"
-
-    if not is_approved(source_id_for_approval_and_log):
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=get_string('MSG_APPROVAL_PENDING')))
-        return
-    message_content = line_bot_api.get_message_content(event.message.id)
-    url_api = "https://api.ocr.space/parse/image"
-    response = requests.post(url_api, files={"image": ("receipt.jpg", message_content.content, "image/jpeg")}, data={"apikey": OCR_SPACE_API_KEY, "language": "tha", "OCREngine": "2"})
-    result = response.json()
-    if result.get("IsErroredOnProcessing") == False and result.get("ParsedResults"):
-        detected_text = result["ParsedResults"][0]["ParsedText"]
-        parsed_data = parse_slip(detected_text)
-        aliases = get_aliases()
-        display_account = aliases.get(parsed_data.get('account'), parsed_data.get('account'))
-        display_recipient = aliases.get(parsed_data.get('recipient'), parsed_data.get('recipient'))
-        summary_text = (
-            f"{get_string('LABEL_SUMMARY')} ({get_string('LABEL_RECORDED_BY')}: {sender_name}):\n-------------------\n"
-            f"{get_string('LABEL_DATE')}: {parsed_data.get('date', 'N/A')}\n{get_string('LABEL_FROM')}: {display_account}\n"
-            f"{get_string('LABEL_TO')}: {display_recipient}\n{get_string('LABEL_AMOUNT')}: {parsed_data.get('amount', 'N/A')} {get_string('LABEL_AMOUNT_UNIT')}\n"
-            f"{get_string('LABEL_REF')}: {parsed_data.get('ref_id', 'N/A')}"
-        )
-        log_data = {'date': parsed_data.get('date', 'N/A'), 'from': display_account, 'to': display_recipient, 'amount': parsed_data.get('amount', 0.0), 'ref_id': parsed_data.get('ref_id', 'N/A'), 'source_id': source_id_for_approval_and_log, 'sender_name': sender_name, 'sender_id': sender_id, 'source_group_name': group_name}
-        log_success, log_message = log_transaction_to_sheet(log_data)
-        final_reply_text = f"{summary_text}\n-------------------\n{get_string('LABEL_STATUS')}: {log_message}"
+# --- Parser เฉพาะสำหรับแต่ละธนาคาร (ตอนนี้ทำหน้าที่เป็น Fallback) ---
+def _parse_kbank_slip(text):
+    data = {}
+    account_match = re.search(r'(?:น\.ส\.|นาย)\s+(.*?)\n', text)
+    if account_match: data['account'] = account_match.group(1).strip()
+    if "TrueMoney Wallet" in text: data['recipient'] = "TrueMoney Wallet"
+    elif "ShopeePay" in text or "รี Shopee" in text: data['recipient'] = "ShopeePay"
     else:
-        final_reply_text = get_string('MSG_OCR_ERROR')
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=final_reply_text))
+        recipient_match = re.search(r'Prompt\s*Pay\s*\n(.*?)\n', text, re.MULTILINE)
+        if recipient_match: data['recipient'] = recipient_match.group(1).strip()
+    return data
 
-@handler.add(MessageEvent, message=TextMessage)
-def handle_text_message(event):
-    text = event.message.text.lower().strip()
-    source = event.source
-    user_id = source.user_id
-    source_id_for_approval_and_summary = source.group_id if isinstance(source, SourceGroup) else user_id
-    if is_approved(source_id_for_approval_and_summary):
-        if text == "สรุปเดือนนี้":
-            reply_text = generate_summary('month', source_id_for_approval_and_summary)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-        elif text == "สรุปปีนี้":
-            reply_text = generate_summary('year', source_id_for_approval_and_summary)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-    if user_id == ADMIN_USER_ID:
-        original_text = event.message.text
-        if original_text.lower().startswith("alias:"):
-            try:
-                command_body = original_text[len("alias:"):].strip()
-                original_name, nickname = [part.strip() for part in command_body.split('=', 1)]
-                success, message = add_alias_to_sheet(original_name, nickname)
-                reply_text = message
-            except ValueError: reply_text = get_string('MSG_ALIAS_CMD_ERROR')
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-        elif text == "reload aliases":
-            global _aliases_cache
-            _aliases_cache = None; aliases = get_aliases()
-            reply_text = get_string('MSG_ALIAS_RELOAD_SUCCESS', count=len(aliases))
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-        elif text == "reload config":
-            global _config_cache
-            _config_cache = None; config = get_config()
-            reply_text = f"โหลดข้อความใหม่ {len(config)} รายการสำเร็จ!"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-    if text in ["ping", "wake up", "ตื่น", "หวัดดี", "สวัสดี"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=get_string('MSG_WAKE_UP')))
-@handler.add(JoinEvent)
-def handle_join(event):
-    if isinstance(event.source, SourceGroup):
-        try: group_name = line_bot_api.get_group_summary(event.source.group_id).group_name
-        except: group_name = "Unknown Group"
-        register_source(event.source.group_id, group_name, 'group')
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"สวัสดีครับ! บอทได้รับการเพิ่มเข้ากลุ่ม '{group_name}' แล้ว และกำลังรอการอนุมัติเพื่อเริ่มใช้งานครับ"))
-@handler.add(FollowEvent)
-def handle_follow(event):
-    if isinstance(event.source, SourceUser):
-        try: display_name = line_bot_api.get_profile(event.source.user_id).display_name
-        except: display_name = "Unknown User"
-        register_source(event.source.user_id, display_name, 'user')
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="ขอบคุณที่เพิ่มเป็นเพื่อนครับ! กำลังรอการอนุมัติเพื่อเริ่มใช้งาน"))
+def _parse_scb_slip(text):
+    data = {}
+    from_match = re.search(r'จาก\s*\n(.*?)\n', text, re.MULTILINE)
+    if from_match: data['account'] = from_match.group(1).strip()
+    to_match = re.search(r'ไปยัง\s*\n(.*?)\n', text, re.MULTILINE)
+    if to_match: data['recipient'] = to_match.group(1).strip()
+    return data
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+def _parse_bbl_slip(text):
+    data = {}
+    # โลจิกเดิมอาจจะยังทำงานได้กับสลิป BBL แบบโอนเงิน ไม่ใช่ชำระบิล
+    try:
+        from_match = re.search(r'จาก\s*\n(.*?)\n', text, re.MULTILINE)
+        if not from_match: from_match = re.search(r'จาก\s+(นาย|นาง|น\.ส\.)\s+([^\n]+)', text)
+        if from_match: data['account'] = from_match.group(1).strip() if len(from_match.groups()) == 1 else " ".join(from_match.groups())
+
+        to_match = re.search(r'ไปที่\s*\n(.*?)\n', text, re.MULTILINE)
+        if not to_match: to_match = re.search(r'ไปยัง\s*\n(.*?)\n', text, re.MULTILINE)
+        if to_match: data['recipient'] = to_match.group(1).strip()
+    except Exception: pass
+    return data
+
+# --- ฟังก์ชันหลัก (ตัวจัดการ/Router - อัปเกรดเป็น Rule Engine!) ---
+def parse_slip(text, rules): # <-- แก้ไข: รับ rules เข้ามา
+    final_data = {'date': 'N/A', 'amount': 'N/A', 'recipient': 'N/A', 'account': 'N/A', 'ref_id': 'N/A'}
+    
+    # 1. หาข้อมูลพื้นฐานที่หาได้ง่ายๆ ก่อนเสมอ
+    date_match = re.search(r'(\d{1,2})\s+(ม\.ค\.|ก\.พ\.|มี\.ค\.|เม\.ย\.|พ\.ค\.|มิ\.ย\.|ก\.ค\.|ส\.ค\.|ก\.ย\.|ต\.ค\.|พ\.ย\.|ธ\.ค\.)\s+(\d{2,4})', text)
+    if date_match:
+        final_data['date'] = normalize_date(date_match.group(1), date_match.group(2), date_match.group(3))
+    final_data['amount'] = find_amount(text)
+    final_data['ref_id'] = find_reference_id(text)
+    
+    # 2. *** Rules Engine ใหม่ ***
+    # วนลูปตามกฎที่ได้รับมาทั้งหมด
+    for rule in rules:
+        identifier = rule.get('IdentifierText')
+        target_field = rule.get('TargetField')
+        method = rule.get('SearchMethod')
+        
+        # ถ้ายังหา field นั้นไม่เจอ และมีคำสำคัญอยู่ในสลิป
+        if final_data.get(target_field) == 'N/A' and identifier in text:
+            if method == 'FIXED_VALUE':
+                final_data[target_field] = rule.get('FixedValue')
+            elif method == 'REGEX':
+                search_term = rule.get('SearchTerm')
+                match = re.search(search_term, text, re.MULTILINE)
+                if match:
+                    # พยายามหา group 1 ถ้าไม่มีเอา group 0
+                    final_data[target_field] = match.group(1) if len(match.groups()) > 0 else match.group(0)
+
+    # 3. *** Fallback Mechanism ***
+    # ถ้าหลังจากใช้ Rules Engine แล้วยังหาข้อมูลบางอย่างไม่เจอ ให้ลองใช้ Parser แบบเก่า
+    if final_data['recipient'] == 'N/A' or final_data['account'] == 'N/A':
+        fallback_data = {}
+        if "K+" in text or "กสิกรไทย" in text:
+            fallback_data = _parse_kbank_slip(text)
+        elif "SCB" in text:
+            fallback_data = _parse_scb_slip(text)
+        elif "Bangkok Bank" in text:
+            fallback_data = _parse_bbl_slip(text)
+        
+        # เติมข้อมูลเฉพาะส่วนที่ยังขาดอยู่
+        for key, value in fallback_data.items():
+            if final_data.get(key) == 'N/A' and value:
+                final_data[key] = value
+
+    # 4. ทำความสะอาดข้อมูลครั้งสุดท้าย
+    for key, value in final_data.items():
+        if value is None or (isinstance(value, str) and not value.strip()):
+            final_data[key] = 'N/A'
+            
+    return final_data
