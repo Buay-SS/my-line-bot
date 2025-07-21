@@ -13,6 +13,7 @@ from linebot.models import (MessageEvent, ImageMessage, TextSendMessage, JoinEve
 from slip_parser import parse_slip
 
 # --- ส่วนตั้งค่าและเริ่มต้น (เหมือนเดิม) ---
+# ...
 CHANNEL_ACCESS_TOKEN = os.environ.get('CHANNEL_ACCESS_TOKEN')
 CHANNEL_SECRET = os.environ.get('CHANNEL_SECRET')
 OCR_SPACE_API_KEY = os.environ.get('OCR_SPACE_API_KEY')
@@ -25,11 +26,11 @@ line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
 # --- ระบบ Cache (เหมือนเดิม) ---
+# ...
 _spreadsheet = None
 _aliases_cache = None
 _config_cache = None
 
-# (ฟังก์ชัน get_spreadsheet, get_aliases, get_config, get_string ทั้งหมดเหมือนเดิม)
 def get_spreadsheet():
     global _spreadsheet
     if _spreadsheet: return _spreadsheet
@@ -64,14 +65,13 @@ def get_config():
         _config_cache = {record['Key']: record['Value'] for record in records if record.get('Key')}
         return _config_cache
     except: _config_cache = {}; return _config_cache
-
 def get_string(key, **kwargs):
     config = get_config()
     template = config.get(key, key)
     return template.format(**kwargs) if kwargs else template
 
 # =========================================================
-#  **ฟังก์ชันใหม่ล่าสุด: สร้างสรุปยอดค่าใช้จ่าย**
+#  **อัปเกรดฟังก์ชันสรุปยอด ให้รองรับวันที่หลายรูปแบบ**
 # =========================================================
 def generate_summary(period):
     spreadsheet = get_spreadsheet()
@@ -84,32 +84,49 @@ def generate_summary(period):
         aliases = get_aliases()
         known_nicknames = set(aliases.values())
         
-        # กรองข้อมูลตามช่วงเวลา
         thai_tz = timezone(timedelta(hours=7))
         now = datetime.now(thai_tz)
         
         filtered_records = []
-        for record in all_records:
-            try:
-                # แปลง TransactionDate (YYYY-MM-DD) เป็น object datetime
-                record_date = datetime.strptime(record['TransactionDate'], '%Y-%m-%d')
-                if period == 'month' and record_date.year == now.year and record_date.month == now.month:
-                    filtered_records.append(record)
-                elif period == 'year' and record_date.year == now.year:
-                    filtered_records.append(record)
-            except (ValueError, TypeError):
-                continue # ข้ามรายการที่วันที่ผิดรูปแบบ
+        # --- จุดที่แก้ไข ---
+        # สร้างลิสต์ของรูปแบบวันที่ที่เรายอมรับ
+        accepted_date_formats = ['%Y-%m-%d', '%m-%d-%Y', '%d-%m-%Y']
 
+        for record in all_records:
+            record_date = None
+            date_str = record.get('TransactionDate')
+            if not date_str: continue
+
+            # พยายามแปลงวันที่ทีละรูปแบบจนกว่าจะสำเร็จ
+            for fmt in accepted_date_formats:
+                try:
+                    record_date = datetime.strptime(date_str, fmt)
+                    break # ถ้าสำเร็จ ให้ออกจากลูป
+                except (ValueError, TypeError):
+                    continue # ถ้าล้มเหลว ให้ลองรูปแบบถัดไป
+            
+            # ถ้าลองทุกรูปแบบแล้วยังแปลงไม่ได้ ก็ข้ามรายการนี้ไป
+            if not record_date:
+                continue
+
+            # กรองข้อมูลตามช่วงเวลา
+            if period == 'month' and record_date.year == now.year and record_date.month == now.month:
+                filtered_records.append(record)
+            elif period == 'year' and record_date.year == now.year:
+                filtered_records.append(record)
+        
+        # --- ส่วนที่เหลือเหมือนเดิม ---
         if not filtered_records:
             return f"ไม่พบข้อมูลรายจ่ายสำหรับ{'เดือนนี้' if period == 'month' else 'ปีนี้'}"
 
-        # จัดกลุ่มและรวมยอด
         summary_data = defaultdict(float)
         total_amount = 0.0
 
         for record in filtered_records:
             try:
-                amount = float(record['Amount'])
+                # แปลง Amount ที่อาจมีคอมม่า
+                amount_str = str(record.get('Amount', '0')).replace(',', '')
+                amount = float(amount_str)
                 recipient = record['ToRecipient']
                 
                 total_amount += amount
@@ -121,7 +138,6 @@ def generate_summary(period):
             except (ValueError, TypeError):
                 continue
 
-        # จัดรูปแบบข้อความตอบกลับ
         header = f"สรุปรายจ่าย{'เดือนนี้' if period == 'month' else 'ปีนี้'}"
         reply_lines = [
             header,
@@ -129,9 +145,7 @@ def generate_summary(period):
             "รายละเอียด"
         ]
         
-        # เรียงตามยอดจ่ายจากมากไปน้อย
         sorted_summary = sorted(summary_data.items(), key=lambda item: item[1], reverse=True)
-
         for recipient, amount in sorted_summary:
             reply_lines.append(f"{recipient}  {amount:,.2f} บาท")
             
@@ -141,57 +155,7 @@ def generate_summary(period):
         print(f"--- ERROR generating summary: {e} ---")
         return f"เกิดข้อผิดพลาดในการสร้างสรุป: {e}"
 
-
-# --- Event Handler: ข้อความ (อัปเกรด!) ---
-@handler.add(MessageEvent, message=TextMessage)
-def handle_text_message(event):
-    text = event.message.text.lower().strip() # .lower() และ .strip() เพื่อความแม่นยำ
-    user_id = event.source.user_id
-
-    # คำสั่งสำหรับแอดมินเท่านั้น
-    if user_id == ADMIN_USER_ID:
-        # คำสั่งสรุปยอด
-        if text == "สรุปเดือนนี้":
-            reply_text = generate_summary('month')
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-        elif text == "สรุปปีนี้":
-            reply_text = generate_summary('year')
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-
-        # คำสั่ง alias (ใช้ text ดั้งเดิม ไม่ใช่ lower case)
-        original_text = event.message.text
-        if original_text.lower().startswith("alias:"):
-            try:
-                command_body = original_text[len("alias:"):].strip()
-                original_name, nickname = [part.strip() for part in command_body.split('=', 1)]
-                success, message = add_alias_to_sheet(original_name, nickname)
-                reply_text = message
-            except ValueError:
-                reply_text = get_string('MSG_ALIAS_CMD_ERROR')
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-
-        # คำสั่ง Reload
-        elif text == "reload aliases":
-            global _aliases_cache
-            _aliases_cache = None; aliases = get_aliases()
-            reply_text = get_string('MSG_ALIAS_RELOAD_SUCCESS', count=len(aliases))
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-        elif text == "reload config":
-            global _config_cache
-            _config_cache = None; config = get_config()
-            reply_text = f"โหลดข้อความใหม่ {len(config)} รายการสำเร็จ!"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-            return
-
-    # คำสั่งปลุกบอท (สำหรับทุกคน)
-    if text in ["ping", "wake up", "ตื่น", "หวัดดี", "สวัสดี"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=get_string('MSG_WAKE_UP')))
-
-# (โค้ดส่วนอื่นๆ ที่เหลือทั้งหมดเหมือนเดิม ไม่ต้องแก้ไข)
+# (โค้ดส่วนที่เหลือทั้งหมดเหมือนเดิม ไม่ต้องแก้ไข)
 # ...
 def add_alias_to_sheet(original_name, nickname):
     spreadsheet = get_spreadsheet()
@@ -259,6 +223,45 @@ def callback():
     except InvalidSignatureError: abort(400)
     return 'OK'
 
+@handler.add(MessageEvent, message=TextMessage)
+def handle_text_message(event):
+    text = event.message.text.lower().strip()
+    user_id = event.source.user_id
+    if user_id == ADMIN_USER_ID:
+        if text == "สรุปเดือนนี้":
+            reply_text = generate_summary('month')
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            return
+        elif text == "สรุปปีนี้":
+            reply_text = generate_summary('year')
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            return
+        original_text = event.message.text
+        if original_text.lower().startswith("alias:"):
+            try:
+                command_body = original_text[len("alias:"):].strip()
+                original_name, nickname = [part.strip() for part in command_body.split('=', 1)]
+                success, message = add_alias_to_sheet(original_name, nickname)
+                reply_text = message
+            except ValueError:
+                reply_text = get_string('MSG_ALIAS_CMD_ERROR')
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            return
+        elif text == "reload aliases":
+            global _aliases_cache
+            _aliases_cache = None; aliases = get_aliases()
+            reply_text = get_string('MSG_ALIAS_RELOAD_SUCCESS', count=len(aliases))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            return
+        elif text == "reload config":
+            global _config_cache
+            _config_cache = None; config = get_config()
+            reply_text = f"โหลดข้อความใหม่ {len(config)} รายการสำเร็จ!"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            return
+    if text in ["ping", "wake up", "ตื่น", "หวัดดี", "สวัสดี"]:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=get_string('MSG_WAKE_UP')))
+
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
     source = event.source
@@ -283,7 +286,6 @@ def handle_image_message(event):
     if not is_approved(source_for_approval):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=get_string('MSG_APPROVAL_PENDING')))
         return
-
     message_content = line_bot_api.get_message_content(event.message.id)
     url_api = "https://api.ocr.space/parse/image"
     response = requests.post(url_api, files={"image": ("receipt.jpg", message_content.content, "image/jpeg")}, data={"apikey": OCR_SPACE_API_KEY, "language": "tha", "OCREngine": "2"})
