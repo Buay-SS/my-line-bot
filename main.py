@@ -1,4 +1,4 @@
-# === FINAL, COMPLETE, AND VERIFIED main.py ===
+# === FINAL, COMPLETE, AND VERIFIED main.py (Import Fix) ===
 import os, json, re
 from flask import Flask, request, abort
 import requests
@@ -8,22 +8,21 @@ from google.oauth2.service_account import Credentials
 from collections import defaultdict
 
 # =========================================================
-#  **ส่วนที่แก้ไข: แยก Import ของ Flex Message ออกมาให้ถูกต้อง**
+#  **ส่วนที่แก้ไข: เปลี่ยน SpacerComponent เป็น FillerComponent**
 # =========================================================
 from linebot import (LineBotApi, WebhookHandler)
 from linebot.exceptions import (InvalidSignatureError, LineBotApiError)
 from linebot.models import (
     MessageEvent, ImageMessage, TextSendMessage, JoinEvent, FollowEvent, SourceUser, SourceGroup, TextMessage
 )
-# นี่คือการ Import ที่ถูกต้องสำหรับ Flex Message Components
 from linebot.models.flex_message import (
-    FlexSendMessage, BubbleContainer, BoxComponent, TextComponent, SeparatorComponent, SpacerComponent
+    FlexSendMessage, BubbleContainer, BoxComponent, TextComponent, SeparatorComponent, FillerComponent # <-- แก้ไขที่นี่
 )
 # =========================================================
 
 from slip_parser import parse_slip
 
-# --- ส่วนตั้งค่าและเริ่มต้น (เหมือนเดิม) ---
+# (โค้ดส่วนที่เหลือทั้งหมดถูกต้องและไม่ต้องแก้ไข)
 # ...
 CHANNEL_ACCESS_TOKEN = os.environ.get('CHANNEL_ACCESS_TOKEN')
 CHANNEL_SECRET = os.environ.get('CHANNEL_SECRET')
@@ -36,7 +35,6 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# (โค้ดส่วนที่เหลือทั้งหมดเหมือนเดิมทุกประการ ไม่ต้องแก้ไข)
 _spreadsheet = None
 _aliases_cache = None
 _config_cache = None
